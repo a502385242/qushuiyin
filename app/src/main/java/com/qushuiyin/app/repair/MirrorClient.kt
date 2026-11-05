@@ -31,10 +31,14 @@ class MirrorClient(
     suspend fun fetch(): Bundle? = coroutineScope {
         if (mirrors.isEmpty()) return@coroutineScope null
 
+        // 同一次修复里所有请求共用一个桶值：manifest 与 .sig 必须来自同一次「新鲜窗口」，
+        // 否则一个拿到旧缓存一个拿到新的，验签必然失败（虽然不是灾难，但白白浪费一次机会）。
+        val bucket = System.currentTimeMillis() / 60_000
+
         val first = Channel<Bundle>(Channel.CONFLATED)
         val jobs = mirrors.map { base ->
             launch(Dispatchers.IO) {
-                runCatching { fetchFrom(base) }.getOrNull()?.let { first.send(it) }
+                runCatching { fetchFrom(base, bucket) }.getOrNull()?.let { first.send(it) }
             }
         }
         // 三个镜像都失败时立刻收摊，不要干等到总超时
@@ -50,14 +54,24 @@ class MirrorClient(
         result
     }
 
-    private suspend fun fetchFrom(base: String): Bundle? = coroutineScope {
-        val manifestJob = async(Dispatchers.IO) { get(base + MANIFEST_FILE) }
-        val sigJob = async(Dispatchers.IO) { get(base + SIG_FILE) }
+    private suspend fun fetchFrom(base: String, bucket: Long): Bundle? = coroutineScope {
+        val manifestJob = async(Dispatchers.IO) { get(freshUrl(base + MANIFEST_FILE, bucket)) }
+        val sigJob = async(Dispatchers.IO) { get(freshUrl(base + SIG_FILE, bucket)) }
         val raw = manifestJob.await() ?: return@coroutineScope null
         val sig = sigJob.await() ?: return@coroutineScope null
         if (raw.isEmpty() || sig.isEmpty()) return@coroutineScope null
         Bundle(raw, String(sig, Charsets.UTF_8).trim(), base)
     }
+
+    /**
+     * jsDelivr 对 `@main` 有约 12 小时的边缘缓存，不加这个参数的话，
+     * 你推了新规则，用户可能半天后才拿到。
+     *
+     * 按分钟分桶而不是每次用新随机数：同一分钟内的用户共享同一份缓存，
+     * 既保证新鲜度，又不会把每个请求都变成一次回源。
+     */
+    internal fun freshUrl(url: String, bucket: Long): String =
+        if (url.contains('?')) "$url&v=$bucket" else "$url?v=$bucket"
 
     private suspend fun get(url: String): ByteArray? = withTimeoutOrNull(PER_REQUEST_TIMEOUT_MS) {
         runCatching {

@@ -97,8 +97,23 @@ git push
 用户下次点修复即可恢复；如果之前解析成功过，App 会静默预取（6 小时内最多一次），
 真正遇到失效时规则往往已经是新的。
 
-**注意**：jsDelivr 会缓存 `@main` 约 12 小时，raw.githubusercontent.com 几分钟内生效。
-镜像并发竞速取最快的一份，所以紧急发版时优先依赖 raw；jsDelivr 只作为 raw 不可达时的兜底。
+**镜像顺序是按国内实测可达性排的**，不是按「谁的官方」排：
+
+| 顺序 | 地址 | 实测 |
+|---|---|---|
+| 1 | `fastly.jsdelivr.net` | 0.7~1.4s，稳定 |
+| 2 | `cdn.jsdelivr.net` | 同源备用 |
+| 3 | `raw.githubusercontent.com` | 内容最权威、更新最即时，但国内常卡在 DNS/TLS 阶段，实测偶发连不上 |
+
+jsDelivr 对 `@main` 有约 12 小时的边缘缓存，所以客户端每次请求都会带上**按分钟分桶**的
+`?v=<bucket>`（见 `MirrorClient.freshUrl`）。同一分钟内的用户共享同一份缓存，
+既保证你推完规则几分钟内就生效，又不会让每个请求都回源。
+
+推完规则想确认线上可用了：
+
+```bash
+curl -sL "https://fastly.jsdelivr.net/gh/a502385242/qushuiyin@main/config/manifest.json" | head -3
+```
 
 ### 密钥
 

@@ -16,16 +16,20 @@ val localProps = Properties().apply {
 fun localProp(key: String, fallback: String): String = localProps.getProperty(key) ?: fallback
 
 /**
- * 规则文件的镜像目录（按可靠性从高到低，客户端会并发竞速，取最先返回且验签通过的一份）。
+ * 规则文件的镜像目录（客户端并发竞速，取最先返回且验签通过的一份）。
  *
- * 1. raw.githubusercontent.com —— 更新最即时，但国内偶尔被 DNS 污染
- * 2. fastly.jsdelivr.net —— 国内可用的 jsDelivr 节点，缓存 @main 约 12 小时
- * 3. cdn.jsdelivr.net —— 兜底
+ * 顺序按国内实测可达性排，不按「谁的官方」排：
+ * 1. fastly.jsdelivr.net —— 国内基本稳定，实测 0.7~1.4s
+ * 2. cdn.jsdelivr.net    —— 同源备用
+ * 3. raw.githubusercontent.com —— 内容最权威、更新最即时，但国内常卡在 DNS / TLS 阶段
+ *
+ * jsDelivr 会缓存 @main 分支约 12 小时，所以客户端每次请求都会带上按分钟分桶的
+ * cache-buster（见 MirrorClient），否则你推了新规则，用户半天后还在拿旧的。
  */
 val defaultMirrors = listOf(
-    "https://raw.githubusercontent.com/a502385242/qushuiyin/main/config/",
     "https://fastly.jsdelivr.net/gh/a502385242/qushuiyin@main/config/",
-    "https://cdn.jsdelivr.net/gh/a502385242/qushuiyin@main/config/"
+    "https://cdn.jsdelivr.net/gh/a502385242/qushuiyin@main/config/",
+    "https://raw.githubusercontent.com/a502385242/qushuiyin/main/config/"
 ).joinToString(",")
 
 /** 验签公钥，对应 keys/public.pem。私钥不进仓库，丢了老版本 App 就再也信不过新规则。 */

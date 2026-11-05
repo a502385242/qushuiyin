@@ -37,10 +37,12 @@ class RepairManager(
 
     suspend fun savedVersion(): Int = store.appliedVersion()
 
-    /** 在线修复：并发拉镜像，最快的一份胜出 */
+    /** 在线修复：并发拉所有镜像，按版本号挑最新的一份采用 */
     suspend fun repair(current: ParseRules): RepairOutcome {
-        val bundle = mirrorClient.fetch() ?: return RepairOutcome.Unreachable
-        return apply(bundle.raw, bundle.signature, bundle.mirror, current)
+        val bundles = mirrorClient.fetchAll()
+        if (bundles.isEmpty()) return RepairOutcome.Unreachable
+        val candidates = bundles.map { RulesGate.Candidate(it.raw, it.signature, it.mirror) }
+        return decide(candidates, current)
     }
 
     /**
@@ -51,25 +53,27 @@ class RepairManager(
         manifestText: String,
         signature: String,
         current: ParseRules
-    ): RepairOutcome = apply(
-        raw = manifestText.trim().toByteArray(Charsets.UTF_8),
-        signature = signature,
-        source = "手动导入",
-        current = current
+    ): RepairOutcome = decide(
+        listOf(
+            RulesGate.Candidate(
+                raw = manifestText.trim().toByteArray(Charsets.UTF_8),
+                signature = signature,
+                source = "手动导入"
+            )
+        ),
+        current
     )
 
-    private suspend fun apply(
-        raw: ByteArray,
-        signature: String,
-        source: String,
+    private suspend fun decide(
+        candidates: List<RulesGate.Candidate>,
         current: ParseRules
     ): RepairOutcome =
-        when (val d = RulesGate.evaluate(raw, signature, publicKey, appVersionCode, current.schemaVersion)) {
-            is RulesGate.Decision.Accept -> {
-                store.save(d.text, d.rules, source)
-                RepairOutcome.Repaired(d.rules, source)
+        when (val c = RulesGate.choose(candidates, publicKey, appVersionCode, current.schemaVersion)) {
+            is RulesGate.Choice.Repaired -> {
+                store.save(c.text, c.rules, c.source)
+                RepairOutcome.Repaired(c.rules, c.source)
             }
-            RulesGate.Decision.NoUpdate -> RepairOutcome.NoUpdate
-            is RulesGate.Decision.Reject -> RepairOutcome.Rejected(d.reason)
+            RulesGate.Choice.NoUpdate -> RepairOutcome.NoUpdate
+            is RulesGate.Choice.Rejected -> RepairOutcome.Rejected(c.reason)
         }
 }

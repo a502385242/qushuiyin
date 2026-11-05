@@ -94,4 +94,73 @@ class RulesGateTest {
         )
         assertEquals(listOf("https://a.example/config/", "https://b.example/x/"), list)
     }
+
+    // ---------- 多镜像挑选（回归测试） ----------
+
+    /** 上一版真发过的 v2 规则，签名有效但内容已过时 */
+    private fun staleRaw(): ByteArray =
+        javaClass.getResourceAsStream("/manifest_v2_stale.json")!!.readBytes()
+
+    private fun staleSig(): String =
+        javaClass.getResourceAsStream("/manifest_v2_stale.json.sig")!!
+            .bufferedReader().use { it.readText() }.trim()
+
+    @Test
+    fun `同时收到旧缓存和新规则时选版本更高的那份`() {
+        assumeTrue("本地未生成密钥，跳过", ready())
+
+        // 这就是线上真实发生过的情形：jsDelivr 先返回 12 小时前的 v2，raw 后返回 v3。
+        // 旧策略「谁先回用谁」会选中 v2，然后告诉用户「已是最新」。
+        val candidates = listOf(
+            RulesGate.Candidate(staleRaw(), staleSig(), "jsdelivr(旧缓存)"),
+            RulesGate.Candidate(raw(), sig(), "raw")
+        )
+        val choice = RulesGate.choose(candidates, pub(), appVersionCode = 2, currentVersion = 2)
+
+        assertTrue("应当选中新规则，实际 $choice", choice is RulesGate.Choice.Repaired)
+        val repaired = choice as RulesGate.Choice.Repaired
+        assertEquals("必须选版本号高的那份", 3, repaired.rules.schemaVersion)
+        assertEquals("raw", repaired.source)
+    }
+
+    @Test
+    fun `候选顺序不影响结果`() {
+        assumeTrue("本地未生成密钥，跳过", ready())
+
+        val reversed = listOf(
+            RulesGate.Candidate(raw(), sig(), "raw"),
+            RulesGate.Candidate(staleRaw(), staleSig(), "jsdelivr(旧缓存)")
+        )
+        val choice = RulesGate.choose(reversed, pub(), appVersionCode = 2, currentVersion = 2)
+        assertEquals(3, (choice as RulesGate.Choice.Repaired).rules.schemaVersion)
+    }
+
+    @Test
+    fun `只有旧缓存时报告无更新而不是采用它`() {
+        assumeTrue("本地未生成密钥，跳过", ready())
+
+        val choice = RulesGate.choose(
+            listOf(RulesGate.Candidate(staleRaw(), staleSig(), "cdn")),
+            pub(),
+            appVersionCode = 2,
+            currentVersion = 2
+        )
+        assertEquals(RulesGate.Choice.NoUpdate, choice)
+    }
+
+    @Test
+    fun `全部候选都验签失败时给出拒绝理由`() {
+        assumeTrue("本地未生成密钥，跳过", ready())
+
+        val choice = RulesGate.choose(
+            listOf(
+                RulesGate.Candidate(raw(), "AAAA", "a"),
+                RulesGate.Candidate(staleRaw(), "BBBB", "b")
+            ),
+            pub(),
+            appVersionCode = 2,
+            currentVersion = 2
+        )
+        assertTrue(choice is RulesGate.Choice.Rejected)
+    }
 }

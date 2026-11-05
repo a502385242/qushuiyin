@@ -5,21 +5,21 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
 /**
- * 从多个镜像并发拉取规则文件，取**最先成功**的一份。
+ * 从多个镜像并发拉取规则文件，把**窗口内所有成功的响应**都收上来交给调用方挑选。
  *
- * 为什么不是「按顺序试」：国内访问 raw.githubusercontent.com 时常卡在 DNS 阶段，
- * 顺序重试的话第一个镜像超时 4 秒才轮到第二个，用户会以为按钮没反应。
- * 并发发三个请求，谁先回来用谁，总耗时等于最快那个。
+ * 为什么不是「谁先回来用谁」：jsDelivr 对 `@main` 有约 12 小时缓存，而且不认 query 参数，
+ * 于是它常常比 raw.githubusercontent.com 先回但内容更旧。竞速取第一个的结果就是
+ * 旧规则永远赢——推了 v3，用户点修复还是拿 v2。所以这里只负责「收」，选哪份由
+ * [RulesGate.choose] 按版本号决定。
  *
  * 为什么 manifest 和 .sig 要成对拉：签名是针对 manifest 原始字节的，
- * 两份必须来自同一个镜像、同一次发布，混着用会验不过（也可能验过一个错误的组合）。
+ * 两份必须来自同一个镜像、同一次发布，混着用会验不过。
  */
 class MirrorClient(
     private val http: OkHttpClient,
@@ -28,50 +28,38 @@ class MirrorClient(
 
     class Bundle(val raw: ByteArray, val signature: String, val mirror: String)
 
-    suspend fun fetch(): Bundle? = coroutineScope {
-        if (mirrors.isEmpty()) return@coroutineScope null
+    /** 收齐所有镜像的响应（失败的镜像贡献 null），最多等 [TOTAL_WINDOW_MS]；全部返回则立即结束 */
+    suspend fun fetchAll(): List<Bundle> = coroutineScope {
+        if (mirrors.isEmpty()) return@coroutineScope emptyList()
 
-        // 同一次修复里所有请求共用一个桶值：manifest 与 .sig 必须来自同一次「新鲜窗口」，
-        // 否则一个拿到旧缓存一个拿到新的，验签必然失败（虽然不是灾难，但白白浪费一次机会）。
-        val bucket = System.currentTimeMillis() / 60_000
-
-        val first = Channel<Bundle>(Channel.CONFLATED)
+        val channel = Channel<Bundle?>(Channel.UNLIMITED)
         val jobs = mirrors.map { base ->
             launch(Dispatchers.IO) {
-                runCatching { fetchFrom(base, bucket) }.getOrNull()?.let { first.send(it) }
+                channel.send(runCatching { fetchFrom(base) }.getOrNull())
             }
         }
-        // 三个镜像都失败时立刻收摊，不要干等到总超时
-        launch {
-            jobs.joinAll()
-            first.close()
-        }
 
-        val result = withTimeoutOrNull(TOTAL_TIMEOUT_MS) {
-            first.receiveCatching().getOrNull()
+        val collected = mutableListOf<Bundle>()
+        withTimeoutOrNull(TOTAL_WINDOW_MS) {
+            var received = 0
+            while (received < mirrors.size) {
+                val bundle = channel.receive()
+                received++
+                if (bundle != null) collected.add(bundle)
+            }
         }
         jobs.forEach { it.cancel() }
-        result
+        collected
     }
 
-    private suspend fun fetchFrom(base: String, bucket: Long): Bundle? = coroutineScope {
-        val manifestJob = async(Dispatchers.IO) { get(freshUrl(base + MANIFEST_FILE, bucket)) }
-        val sigJob = async(Dispatchers.IO) { get(freshUrl(base + SIG_FILE, bucket)) }
+    private suspend fun fetchFrom(base: String): Bundle? = coroutineScope {
+        val manifestJob = async(Dispatchers.IO) { get(base + MANIFEST_FILE) }
+        val sigJob = async(Dispatchers.IO) { get(base + SIG_FILE) }
         val raw = manifestJob.await() ?: return@coroutineScope null
         val sig = sigJob.await() ?: return@coroutineScope null
         if (raw.isEmpty() || sig.isEmpty()) return@coroutineScope null
         Bundle(raw, String(sig, Charsets.UTF_8).trim(), base)
     }
-
-    /**
-     * jsDelivr 对 `@main` 有约 12 小时的边缘缓存，不加这个参数的话，
-     * 你推了新规则，用户可能半天后才拿到。
-     *
-     * 按分钟分桶而不是每次用新随机数：同一分钟内的用户共享同一份缓存，
-     * 既保证新鲜度，又不会把每个请求都变成一次回源。
-     */
-    internal fun freshUrl(url: String, bucket: Long): String =
-        if (url.contains('?')) "$url&v=$bucket" else "$url?v=$bucket"
 
     private suspend fun get(url: String): ByteArray? = withTimeoutOrNull(PER_REQUEST_TIMEOUT_MS) {
         runCatching {
@@ -96,10 +84,10 @@ class MirrorClient(
         private const val SIG_FILE = "manifest.json.sig"
 
         /** 单个请求超时 */
-        private const val PER_REQUEST_TIMEOUT_MS = 6_000L
+        private const val PER_REQUEST_TIMEOUT_MS = 4_000L
 
-        /** 整轮竞速的总预算：再慢就告诉用户「没拉到」，不要让他等 */
-        private const val TOTAL_TIMEOUT_MS = 5_000L
+        /** 收款窗口：再慢就当作没拉到。三个镜像都返回时不必等满 */
+        private const val TOTAL_WINDOW_MS = 5_000L
 
         /** 规则文件正常只有 1~4KB，超过这个量级说明拉到了错误的东西（比如一个 HTML 错误页） */
         private const val MAX_BYTES = 256 * 1024

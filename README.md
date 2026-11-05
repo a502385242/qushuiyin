@@ -135,14 +135,22 @@ git push
 | 2 | `cdn.jsdelivr.net` | 同源备用 |
 | 3 | `raw.githubusercontent.com` | 内容最权威、更新最即时，但国内常卡在 DNS/TLS 阶段，实测偶发连不上 |
 
-jsDelivr 对 `@main` 有约 12 小时的边缘缓存，所以客户端每次请求都会带上**按分钟分桶**的
-`?v=<bucket>`（见 `MirrorClient.freshUrl`）。同一分钟内的用户共享同一份缓存，
-既保证你推完规则几分钟内就生效，又不会让每个请求都回源。
+### 缓存陷阱：为什么不能「谁先回来用谁」
 
-推完规则想确认线上可用了：
+jsDelivr 对 `@main` 有约 12 小时边缘缓存，而且**不认 query 参数**——加 `?v=123` 一样返回旧内容
+（purge API 报告成功也未必立刻生效，实测 purge 后仍然拿到旧版）。
+
+于是出现过一个真实的 bug：镜像竞速时 CDN 比 raw 先返回，**旧规则永远赢过新规则**，
+你推了 v3，用户点修复拿到的还是 v2，还提示「已是最新」。
+
+现在的做法：`MirrorClient.fetchAll()` 把窗口内所有响应都收上来，
+`RulesGate.choose()` **取版本号最大的那份**。旧缓存于是变成无害噪声，而不是决策依据。
+回归测试用一份真发过的 v2（签名有效、内容过时）验证这个行为。
+
+推完规则想确认线上生效（**直接看 raw，别信 CDN 的即时性**）：
 
 ```bash
-curl -sL "https://fastly.jsdelivr.net/gh/a502385242/qushuiyin@main/config/manifest.json" | head -3
+curl -sL "https://raw.githubusercontent.com/a502385242/qushuiyin/main/config/manifest.json" | head -3
 ```
 
 ### 密钥

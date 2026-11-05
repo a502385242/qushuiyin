@@ -37,6 +37,53 @@ object RulesGate {
         data class Reject(val reason: String, val retryable: Boolean = false) : Decision
     }
 
+    /** 一个候选：某个镜像返回的原始字节 + 它的签名 + 来源（诊断用） */
+    class Candidate(val raw: ByteArray, val signature: String, val source: String)
+
+    sealed interface Choice {
+        data class Repaired(val rules: ParseRules, val text: String, val source: String) : Choice
+        data object NoUpdate : Choice
+        data class Rejected(val reason: String) : Choice
+    }
+
+    /**
+     * 从多个镜像的候选里挑一份采用。
+     *
+     * **不能取「最先返回的那份」**，这是踩过的坑：jsDelivr 对 `@main` 有约 12 小时缓存，
+     * 而且它**不认 query 参数**（加 `?v=` 一样返回旧内容）。镜像竞速时 CDN 往往比
+     * raw.githubusercontent.com 先回，于是旧规则永远赢过新规则——你推了 v3，
+     * 所有用户点修复拿到的还是 v2，还提示「已是最新」。
+     *
+     * 所以策略改成：收齐窗口内所有响应，**取版本号最大的那份**。
+     * 旧缓存于是变成一个无害的噪声，而不是决策依据。
+     */
+    fun choose(
+        candidates: List<Candidate>,
+        publicKeyB64: String,
+        appVersionCode: Int,
+        currentVersion: Int
+    ): Choice {
+        var best: Choice.Repaired? = null
+        var sawNoUpdate = false
+        var lastRejectReason: String? = null
+
+        for (c in candidates) {
+            when (val d = evaluate(c.raw, c.signature, publicKeyB64, appVersionCode, currentVersion)) {
+                is Decision.Accept -> {
+                    if (best == null || d.rules.schemaVersion > best!!.rules.schemaVersion) {
+                        best = Choice.Repaired(d.rules, d.text, c.source)
+                    }
+                }
+                Decision.NoUpdate -> sawNoUpdate = true
+                is Decision.Reject -> lastRejectReason = d.reason
+            }
+        }
+
+        return best
+            ?: if (sawNoUpdate) Choice.NoUpdate
+            else Choice.Rejected(lastRejectReason ?: "没有可用的规则")
+    }
+
     /**
      * @param raw            配置文件的**原始字节**（必须与签名时的字节完全一致）
      * @param signature      manifest.json.sig 的内容（Base64 DER）

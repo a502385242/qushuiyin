@@ -1,0 +1,4 @@
+# manifest 与签名文件必须按原始字节保存，禁止任何换行符转换，
+# 否则在 Windows 上 clone 之后签名永远验不过。
+config/manifest.json -text
+config/manifest.json.sig -text

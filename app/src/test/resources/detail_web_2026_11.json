@@ -1,0 +1,68 @@
+{
+  "status_code": 0,
+  "aweme_detail": {
+    "aweme_id": "7699062672146337075",
+    "desc": "好日子也是让我过上了 #疯狂水世界  #海水过滤器  #小肥强",
+    "author": {
+      "nickname": "疯狂水世界"
+    },
+    "images": null,
+    "video": {
+      "duration": 58677,
+      "play_addr": {
+        "url_list": [
+          "https://v11-weba.douyinvod.com/fake/default.mp4"
+        ],
+        "width": 1080,
+        "height": 1920,
+        "data_size": 10120457
+      },
+      "download_suffix_logo_addr": {
+        "url_list": [
+          "https://v11-weba.douyinvod.com/fake/logo.mp4"
+        ]
+      },
+      "bit_rate": [
+        {
+          "gear_name": "normal_1080_0",
+          "bit_rate": 1379819,
+          "quality_type": 1,
+          "play_addr": {
+            "url_list": [
+              "https://v11-weba.douyinvod.com/fake/normal_1080_0.mp4"
+            ],
+            "width": 1080,
+            "height": 1920,
+            "data_size": 10120457
+          }
+        },
+        {
+          "gear_name": "normal_720_0",
+          "bit_rate": 1038370,
+          "quality_type": 10,
+          "play_addr": {
+            "url_list": [
+              "https://v11-weba.douyinvod.com/fake/normal_720_0.mp4"
+            ],
+            "width": 720,
+            "height": 1280,
+            "data_size": 7616057
+          }
+        },
+        {
+          "gear_name": "540_2_1",
+          "bit_rate": 463216,
+          "quality_type": 23,
+          "play_addr": {
+            "url_list": [
+              "https://v11-weba.douyinvod.com/fake/540_2_1.mp4"
+            ],
+            "width": 576,
+            "height": 1024,
+            "data_size": 3397522
+          }
+        }
+      ]
+    }
+  }
+}

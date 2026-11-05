@@ -1,25 +1,27 @@
 {
-  "schemaVersion": 2,
-  "minAppVersion": 1,
+  "schemaVersion": 3,
+  "minAppVersion": 2,
+  "sourceMode": "webview",
+  "detailUrlTemplate": "https://www.douyin.com/video/{id}",
+  "desktopUa": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   "shareHosts": [
     "www.iesdouyin.com",
     "www.douyin.com"
   ],
   "ua": "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
   "itemPaths": [
+    "aweme_detail",
     "loaderData.*.videoInfoRes.item_list[0]",
     "loaderData.*.videoInfoRes.item_list.0",
     "videoInfoRes.item_list[0]",
-    "app.videoDetail.itemInfo.itemStruct",
-    "aweme_detail"
+    "app.videoDetail.itemInfo.itemStruct"
   ],
   "videoUrlPaths": [
     "video.play_addr.url_list[0]",
-    "video.download_addr.url_list[0]",
     "video.playApi"
   ],
   "imageUrlPaths": [
-    "images[].download_url_list[0]",
-    "images[].url_list[0]"
+    "images[].url_list[0]",
+    "images[].download_url_list[0]"
   ]
 }

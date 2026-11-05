@@ -3,9 +3,33 @@
 纯本地的抖音视频/图文下载工具。没有服务器、不需要账号、不申请存储权限。
 
 **核心思路**：无水印不是图像处理，而是**请抖音给你那条已经去掉 logo 的视频流**。
-同一个作品在 CDN 上同时挂着带水印和不带水印的版本，分享面板「保存本地」拿的是带水印那条；
-本工具请求分享页，从页面内嵌的 `_ROUTER_DATA` 里取出不带水印的地址，按字节原样写入相册。
-不做解码、不做转码，因此画质等于平台能给的上限。
+同一个作品在 CDN 上同时挂着带水印和不带水印的版本：分享面板「保存本地」拿的是带水印那条
+（`download_addr`，带 `logo_name` 参数）；`video.bit_rate[]` 里每一档的 `play_addr` 才是不带水印的。
+本工具取 `bit_rate` 最高档的 `play_addr`，按字节原样写入相册。不做解码、不做转码，
+因此画质等于平台能给的上限（实测这条作品最高档是 1080×1920 / 1.38 Mbps / 10.1 MB）。
+
+## ⚠️ 2026-11 抖音改版：必须走 WebView
+
+如果你看到别的教程说「GET 分享页，抠 `_ROUTER_DATA`」，那是**过时**的。实测结果：
+
+| 取数方式 | 结果 |
+|---|---|
+| `GET https://www.iesdouyin.com/share/video/{id}/`（带浏览器 UA） | ❌ 200，但页面只剩 1.4 KB 空壳，`_ROUTER_DATA` 里没有任何作品数据 |
+| 移动 UA（iPhone / Android WebView 默认）打开 | ❌ 跳 `m.douyin.com`，只给 **带水印的 720p**（`playwm` + `logo_name`） |
+| `aweme/v1/web/aweme/detail` 直接请求 | ❌ 403 `Blocked by ArgusSecurityPlugin Uifid Not Found` |
+| **桌面 UA 的真浏览器打开 `douyin.com/video/{id}`** | ✅ 页面自己带着 `a_bogus` 请求 `aweme/detail`，返回 **12 档清晰度** |
+
+所以取数方式改成了：**离屏 WebView + 桌面 UA + 拦截 `aweme/detail` 的响应**。
+让抖音自己的 JS 去算签名，我们只读结果——这样他们改签名算法时，跟着改的是他们，不是我们。
+
+这一条决定了两个不能动的实现细节：
+
+1. **UA 必须是桌面版**。移动 UA 下拿到的只有带水印的 720p，等于这个 App 白做。
+2. **必须跑 WebView**，不能用 OkHttp 模拟。`a_bogus` / `uifid` / `x-secsdk-web-signature`
+   三个参数都是页面 JS 现场算的，复刻等于长期做逆向。
+
+代价是解析要 3~8 秒（有一个「正在通过网页加载作品」的进度提示）。
+
 
 ---
 
@@ -14,13 +38,16 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P1 | 工程骨架、分享入口、链接识别 | ✅ |
-| P2 | 解析核心（候选路径 / HTML 提取 / 错误分类） | ✅ 单测覆盖 |
+| P2 | 解析核心（WebView 取数 + 候选路径 + 错误分类） | ✅ 单测 + 真浏览器验证 |
 | P3 | 下载器 + MediaStore 写入相册 | ⏳ 未开始 |
 | P4 | 失败驱动的在线修复（拉取 → 验签 → 落盘 → 重试） | ✅ 代码完成 |
 | P5 | 历史记录、Release 签名 | ⏳ |
 
-**未验证的部分**：解析链路还没对着真实线上链接跑过（默认规则是按已知结构写的）。
-第一次联调需要用真实分享文案校准 `config/manifest.json` 里的 `itemPaths`。
+**验证到什么程度**：
+- 真实分享链接跑通了全链路（短链 → 作品 ID → 桌面页 → 详情 JSON → 12 档清晰度）
+- 最高档 1080×1920 流下载后抽帧肉眼确认**无水印**，字节数与接口给的 `data_size` 完全一致
+- 拦截脚本（`HOOK_JS`）在真 Chrome 里验证过能截到 73 KB 响应
+- 还没在**真机**上跑过（本机没有 adb），WebView 环节是唯一剩下的不确定项
 
 ---
 
@@ -54,8 +81,10 @@ sdk.dir=D:/devtools/android-sdk
 
 ```
 app/src/main/java/com/qushuiyin/app/
-├── parser/     LinkParser 链接抽取 · JsonPath 候选路径 · HtmlExtractor 抠 JSON
-│               DouyinParser 主流程 · ParseRules 规则结构 · ParseError 错误分类
+├── parser/     WebDetailFetcher 离屏 WebView 取数（钩 XHR/fetch）
+│               DetailSource 取数接口 · DouyinParser 解析主流程
+│               LinkParser 链接抽取 · JsonPath 候选路径 · HtmlExtractor 抠 JSON
+│               ParseRules 规则结构 · ParseError 错误分类
 ├── repair/     MirrorClient 多镜像竞速 · RulesGate 采用判定（纯 JVM，可单测）
 │               RulesStore 持久化 · RepairManager 编排 · Verifier ECDSA 验签
 ├── ui/         HomeScreen · HomeViewModel · Theme
@@ -64,6 +93,7 @@ app/src/main/java/com/qushuiyin/app/
 config/         manifest.json + manifest.json.sig  ← 推到仓库的就是这两份
 keys/           私钥（gitignore，只在本机）与公钥
 tools/          manifest_tool.py 签名工具 · setup-toolchain.sh 环境安装
+                probe-*.js 真浏览器探测脚本（验证取数链路用，不参与打包）
 ```
 
 ---

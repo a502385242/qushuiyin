@@ -27,20 +27,25 @@ class RulesGateTest {
     fun `真实规则文件能通过校验并被采用`() {
         assumeTrue("本地未生成密钥，跳过", ready())
 
-        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 1, currentVersion = 1)
+        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 2, currentVersion = 1)
         assertTrue("应被采用，实际是 $d", d is RulesGate.Decision.Accept)
 
-        val rules = (d as RulesGate.Decision.Accept).rules
-        assertEquals("manifest 的版本号被读错", 2, rules.schemaVersion)
-        assertTrue("候选路径没解析出来", rules.itemPaths.isNotEmpty())
-        assertTrue("规则原文应原样保留，供下次启动复用", (d as RulesGate.Decision.Accept).text.contains("itemPaths"))
+        val accepted = d as RulesGate.Decision.Accept
+        assertEquals("manifest 的版本号被读错", 3, accepted.rules.schemaVersion)
+        assertTrue("候选路径没解析出来", accepted.rules.itemPaths.isNotEmpty())
+        assertTrue("规则原文应原样保留，供下次启动复用", accepted.text.contains("itemPaths"))
+        assertEquals(
+            "线上规则应走 WebView 取数（分享页 SSR 已失效）",
+            "webview",
+            accepted.rules.sourceMode
+        )
     }
 
     @Test
     fun `版本不比本地新时返回 NoUpdate 而不是报错`() {
         assumeTrue("本地未生成密钥，跳过", ready())
 
-        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 1, currentVersion = 2)
+        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 2, currentVersion = 3)
         assertEquals(RulesGate.Decision.NoUpdate, d)
     }
 
@@ -48,8 +53,8 @@ class RulesGateTest {
     fun `App 版本低于规则要求时拒绝并要求升级`() {
         assumeTrue("本地未生成密钥，跳过", ready())
 
-        // minAppVersion = 1，把 App 版本压到 0 就能触发这条分支
-        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 0, currentVersion = 1)
+        // minAppVersion = 2，把 App 版本压到 1 就能触发这条分支
+        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 1, currentVersion = 1)
         assertTrue("应当是拒绝，实际是 $d", d is RulesGate.Decision.Reject)
         val reason = (d as RulesGate.Decision.Reject).reason
         assertTrue("提示里应告诉用户去升级 App，实际是：$reason", reason.contains("版本"))

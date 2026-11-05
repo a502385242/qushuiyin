@@ -5,9 +5,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,14 +18,21 @@ import java.io.IOException
 /**
  * 抖音作品解析器（纯本地，不依赖任何自建服务）。
  *
- * 链路：短链 → 跟随 302 拿作品 ID → 请求分享页 HTML → 抠 _ROUTER_DATA → 按候选路径取作品对象
+ * 链路：短链 → 跟随 302 拿作品 ID → 取详情 JSON → 按候选路径取作品对象
  *
- * 刻意不碰 aweme/detail 接口：那需要 a_bogus 签名，纯客户端实现等于持续做逆向。
- * 分享页是普通 GET，改版频率低得多。
+ * 取详情有两条路，由 [ParseRules.sourceMode] 决定：
+ *   - `webview`（默认）：离屏 WebView 让页面自己请求 `aweme/detail`，我们截获响应。
+ *     该接口要 `a_bogus` 签名，纯客户端复刻等于长期逆向，所以交给页面自己算。
+ *   - `http`：直接 GET 分享页、抠 `_ROUTER_DATA`。2026-11 起分享页只剩空壳，
+ *     这条路的成功率已经是 0，保留只为了哪天线上的结构回滚时不用发版。
+ *
+ * 两条路的产物是同一种 JSON 结构，所以提取逻辑只有一份。
  */
 class DouyinParser(
     private val http: OkHttpClient,
-    rules: ParseRules = ParseRules()
+    rules: ParseRules = ParseRules(),
+    /** 按当前规则造一个详情来源；为 null 时只能用 HTTP 路径 */
+    private val detailSourceFactory: ((ParseRules) -> DetailSource)? = null
 ) {
 
     sealed interface ParseResult {
@@ -47,17 +56,53 @@ class DouyinParser(
         rules = newRules
     }
 
-    suspend fun parse(target: LinkParser.Target): ParseResult = withContext(Dispatchers.IO) {
-        val id = when (target) {
-            is LinkParser.Target.AwemeId -> target.id
-            is LinkParser.Target.ShortLink ->
-                resolveShortLink(target.url) ?: return@withContext ParseResult.Fail(ParseError.Network)
+    suspend fun parse(target: LinkParser.Target, onStage: (String) -> Unit = {}): ParseResult =
+        withContext(Dispatchers.IO) {
+            onStage("正在获取作品 ID")
+            val id = resolveId(target) ?: return@withContext ParseResult.Fail(ParseError.Network)
+            val current = rules
+
+            if (current.sourceMode == ParseRules.SOURCE_WEBVIEW && detailSourceFactory != null) {
+                onStage("正在通过网页加载作品")
+                val json = runCatching { detailSourceFactory.invoke(current).fetch(id) }.getOrNull()
+                if (json != null) {
+                    when (val r = parseDetailJson(json, id)) {
+                        is ParseResult.Ok -> return@withContext r
+                        // 详情拿到了但取不出地址 —— 这是结构问题，再去试已经死掉的 HTTP 路径没意义
+                        is ParseResult.Fail ->
+                            if (r.error == ParseError.Schema) return@withContext r
+                    }
+                }
+                onStage("正在尝试备用通道")
+            }
+
+            when (val fetched = fetchSharePage(id)) {
+                is Fetch.Fail -> ParseResult.Fail(fetched.error)
+                is Fetch.Ok -> extractHtml(fetched.html, id)
+            }
         }
 
-        when (val fetched = fetchSharePage(id)) {
-            is Fetch.Fail -> ParseResult.Fail(fetched.error)
-            is Fetch.Ok -> extract(fetched.html, id)
+    /** 短链 / 裸 ID 统一解析成作品 ID */
+    suspend fun resolveId(target: LinkParser.Target): String? = withContext(Dispatchers.IO) {
+        when (target) {
+            is LinkParser.Target.AwemeId -> target.id
+            is LinkParser.Target.ShortLink -> resolveShortLink(target.url)
         }
+    }
+
+    // ---------- 详情 JSON（WebView 截获） ----------
+
+    /** 解析 `aweme/detail` 的响应体。与 HTML 路径共用同一套提取逻辑。 */
+    fun parseDetailJson(jsonText: String, fallbackId: String): ParseResult {
+        val root = runCatching { Json.parseToJsonElement(jsonText) }.getOrNull()
+            ?: return ParseResult.Fail(ParseError.Schema)
+
+        // 接口自己报错时不要算成「版式变了」，否则用户会得到一个点了没效果的修复按钮
+        val code = (root as? JsonObject)?.get("status_code")?.let { (it as? JsonPrimitive)?.intOrNull }
+        if (code != null && code != 0) {
+            return ParseResult.Fail(ParseError.Unknown("接口返回 status_code=$code"))
+        }
+        return extractRoot(root, fallbackId)
     }
 
     // ---------- 短链解析 ----------
@@ -82,7 +127,7 @@ class DouyinParser(
         }
     }
 
-    // ---------- 抓分享页 ----------
+    // ---------- 备用：抓分享页 ----------
 
     private fun fetchSharePage(id: String): Fetch {
         var lastError: ParseError = ParseError.Network
@@ -119,14 +164,17 @@ class DouyinParser(
 
     // ---------- 数据提取 ----------
 
-    private fun extract(html: String, fallbackId: String): ParseResult {
+    private fun extractHtml(html: String, fallbackId: String): ParseResult {
         val jsonText = HtmlExtractor.extractObject(html, "_ROUTER_DATA")
             ?: HtmlExtractor.extractRenderData(html)
             ?: return ParseResult.Fail(ParseError.Schema)
 
         val root = runCatching { Json.parseToJsonElement(jsonText) }.getOrNull()
             ?: return ParseResult.Fail(ParseError.Schema)
+        return extractRoot(root, fallbackId)
+    }
 
+    private fun extractRoot(root: JsonElement, fallbackId: String): ParseResult {
         val item = rules.itemPaths.firstNotNullOfOrNull { path ->
             JsonPath.first(root, path) as? JsonObject
         } ?: return ParseResult.Fail(
@@ -152,16 +200,17 @@ class DouyinParser(
         return ParseResult.Ok(aweme)
     }
 
-    private fun hasEmptyItemList(root: kotlinx.serialization.json.JsonElement): Boolean =
+    private fun hasEmptyItemList(root: JsonElement): Boolean =
         rules.itemPaths.any { path ->
-            val listPath = path.substringBeforeLast('.')
-            val node = JsonPath.first(root, listPath)
+            val node = JsonPath.first(root, path.substringBeforeLast('.'))
             node is JsonArray && node.isEmpty()
         }
 
     /**
      * 视频地址：先按 bit_rate 从高到低排（这是「无损画质」的关键，
      * 直接取 play_addr 常常是中低码率档），再叠加配置里的兜底路径。
+     *
+     * 注意 `download_addr` 不要当成无水印来源——它带 `logo_name` 参数，是**加了水印**的那条。
      */
     private fun extractVideoUrls(item: JsonObject): List<String> {
         val byBitrate = JsonPath.query(item, "video.bit_rate[]")

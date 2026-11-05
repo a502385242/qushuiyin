@@ -104,6 +104,14 @@ fun HomeScreen(vm: HomeViewModel) {
                 }
             }
 
+            state.stage?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
             state.error?.let { error ->
                 ErrorCard(
                     error = error,

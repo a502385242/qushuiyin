@@ -9,6 +9,7 @@ import com.qushuiyin.app.model.Aweme
 import com.qushuiyin.app.parser.DouyinParser
 import com.qushuiyin.app.parser.LinkParser
 import com.qushuiyin.app.parser.ParseError
+import com.qushuiyin.app.parser.WebDetailFetcher
 import com.qushuiyin.app.repair.MirrorClient
 import com.qushuiyin.app.repair.RepairManager
 import com.qushuiyin.app.repair.RepairOutcome
@@ -22,6 +23,8 @@ import kotlinx.coroutines.launch
 data class HomeUiState(
     val input: String = "",
     val parsing: Boolean = false,
+    /** 解析进度提示（「正在通过网页加载作品」这类）。WebView 路径要几秒，不给反馈用户会以为卡住 */
+    val stage: String? = null,
     val aweme: Aweme? = null,
     val error: ParseError? = null,
     /** 正在拉规则，UI 上按钮转圈 */
@@ -32,7 +35,13 @@ data class HomeUiState(
 
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val parser = DouyinParser(Http.client)
+    private val parser = DouyinParser(
+        http = Http.client,
+        // 每条规则都可能被热更新，所以按当前规则现造一个来源，而不是启动时固定下来
+        detailSourceFactory = { rules ->
+            WebDetailFetcher(app, rules.detailUrlTemplate, rules.desktopUa)
+        }
+    )
 
     private val rulesStore = RulesStore(app)
     private val repairManager = RepairManager(
@@ -70,14 +79,16 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         viewModelScope.launch {
-            _state.update { it.copy(parsing = true, error = null, aweme = null) }
-            when (val r = parser.parse(target)) {
+            _state.update { it.copy(parsing = true, error = null, aweme = null, stage = null) }
+            when (val r = parser.parse(target) { stage ->
+                _state.update { it.copy(stage = stage) }
+            }) {
                 is DouyinParser.ParseResult.Ok -> {
-                    _state.update { it.copy(parsing = false, aweme = r.aweme) }
+                    _state.update { it.copy(parsing = false, aweme = r.aweme, stage = null) }
                     prefetchRulesQuietly()
                 }
                 is DouyinParser.ParseResult.Fail ->
-                    _state.update { it.copy(parsing = false, error = r.error) }
+                    _state.update { it.copy(parsing = false, error = r.error, stage = null) }
             }
         }
     }
@@ -177,15 +188,16 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun retryAfterRepair() {
         val target = LinkParser.parse(_state.value.input) ?: return
-        _state.update { it.copy(parsing = true, error = null, aweme = null) }
-        when (val r = parser.parse(target)) {
+        _state.update { it.copy(parsing = true, error = null, aweme = null, stage = null) }
+        when (val r = parser.parse(target) { stage -> _state.update { it.copy(stage = stage) } }) {
             is DouyinParser.ParseResult.Ok ->
-                _state.update { it.copy(parsing = false, aweme = r.aweme, toast = null) }
+                _state.update { it.copy(parsing = false, aweme = r.aweme, stage = null, toast = null) }
             is DouyinParser.ParseResult.Fail ->
                 _state.update {
                     it.copy(
                         parsing = false,
                         error = r.error,
+                        stage = null,
                         toast = "换了新规则仍然解析不了，可以复制诊断信息反馈"
                     )
                 }

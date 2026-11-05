@@ -62,6 +62,22 @@ android {
         )
     }
 
+    /**
+     * Release 签名。密钥与口令只在 local.properties（不进仓库），
+     * 新克隆的工程没有它时自动退回 debug 签名，仍然能编出可装的包。
+     */
+    signingConfigs {
+        create("release") {
+            val ksPath = localProps.getProperty("release.storeFile")
+            if (ksPath != null && rootProject.file(ksPath).exists()) {
+                storeFile = rootProject.file(ksPath)
+                storePassword = localProps.getProperty("release.storePassword")
+                keyAlias = localProps.getProperty("release.keyAlias")
+                keyPassword = localProps.getProperty("release.keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         debug {
             applicationIdSuffix = ".debug"
@@ -69,12 +85,14 @@ android {
             isMinifyEnabled = false
         }
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            // 暂不开混淆：R8 对 kotlinx.serialization 的 @Serializable 类有裁剪风险，
+            // 而「装上去一打开就崩」比包体大几 MB 更糟。等真机验过再开。
+            isMinifyEnabled = false
+            signingConfig = if (signingConfigs.getByName("release").storeFile != null) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 

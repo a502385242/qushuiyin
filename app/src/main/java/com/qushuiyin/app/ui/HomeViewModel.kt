@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.qushuiyin.app.BuildConfig
 import com.qushuiyin.app.core.Http
+import com.qushuiyin.app.download.Downloader
 import com.qushuiyin.app.model.Aweme
 import com.qushuiyin.app.parser.DouyinParser
 import com.qushuiyin.app.parser.LinkParser
@@ -32,7 +33,15 @@ data class HomeUiState(
     /** 正在拉规则，UI 上按钮转圈 */
     val repairing: Boolean = false,
     /** 一次性提示，展示后清空 */
-    val toast: String? = null
+    val toast: String? = null,
+    /** 正在保存到相册 */
+    val downloading: Boolean = false,
+    /** 保存进度文案（「正在下载 3.2MB / 9.7MB」） */
+    val downloadText: String? = null,
+    /** 0~1，总长未知时为 null（此时只显示百分比未知的进度条） */
+    val downloadProgress: Float? = null,
+    /** 保存成功后的位置，用来在卡片上留一行「已保存到 …」 */
+    val savedTo: String? = null
 )
 
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
@@ -93,7 +102,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             lastSource = null
             _state.update {
-                it.copy(parsing = true, error = null, aweme = null, stage = null, diagnostic = null)
+                it.copy(
+                    parsing = true, error = null, aweme = null, stage = null, diagnostic = null,
+                    savedTo = null, downloadText = null, downloadProgress = null
+                )
             }
             when (val r = parser.parse(target) { stage ->
                 _state.update { it.copy(stage = stage) }
@@ -232,6 +244,62 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     fun consumeToast() {
         _state.update { it.copy(toast = null) }
+    }
+
+    fun showToast(text: String) {
+        _state.update { it.copy(toast = text) }
+    }
+
+    /**
+     * 保存到相册。
+     *
+     * 进度回调和下载不在同一个线程，所以这里只走 `_state.update`（MutableStateFlow
+     * 自身线程安全），不碰任何控件。100ms 级的刷新频率由 Downloader 的节流保证。
+     */
+    fun download() {
+        val aweme = _state.value.aweme ?: return
+        if (_state.value.downloading) return
+        viewModelScope.launch {
+            _state.update {
+                it.copy(
+                    downloading = true,
+                    downloadText = "正在建立连接",
+                    downloadProgress = null,
+                    savedTo = null,
+                    toast = null
+                )
+            }
+            val r = Downloader.save(getApplication(), aweme) { text, frac ->
+                _state.update { s -> s.copy(downloadText = text, downloadProgress = frac) }
+            }
+            when (r) {
+                is Downloader.Result.Ok -> _state.update {
+                    it.copy(
+                        downloading = false,
+                        downloadText = null,
+                        downloadProgress = null,
+                        savedTo = r.where,
+                        toast = if (r.count > 1) "已保存 ${r.count} 张图到相册" else "已保存到相册"
+                    )
+                }
+                is Downloader.Result.Fail -> _state.update {
+                    it.copy(
+                        downloading = false,
+                        downloadText = null,
+                        downloadProgress = null,
+                        toast = "保存失败：${r.message}"
+                    )
+                }
+                Downloader.Result.NeedPermission -> _state.update {
+                    it.copy(
+                        downloading = false,
+                        downloadText = null,
+                        downloadProgress = null,
+                        toast = "需要存储权限才能保存（Android 9 及以下）"
+                    )
+                }
+            }
+        }
     }
 
     private companion object {

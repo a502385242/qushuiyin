@@ -68,18 +68,17 @@ App 把 UA 覆写成 `Windows Chrome/120`，而 `navigator.userAgentData` / `sec
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P1 | 工程骨架、分享入口、链接识别 | ✅ |
-| P2 | 解析核心（移动页拿 `video_id` + play 接口） | ✅ 单测 + 真浏览器验证 |
-| P3 | 下载器 + MediaStore 写入相册 | ⏳ 未开始 |
+| P2 | 解析核心（移动页拿 `video_id` + play 接口） | ✅ 真机跑通 |
+| P3 | 下载器 + MediaStore 写入相册 | ✅ |
 | P4 | 失败驱动的在线修复（拉取 → 验签 → 落盘 → 重试） | ✅ 代码完成 |
-| P5 | 历史记录、Release 签名 | ⏳ |
+| P5 | 历史记录 | ⏳ |
 
 **验证到什么程度**：
 - 短链 → 作品 ID → 移动页 → `video_id` → play 接口，整条链路在真 Chrome 里跑通了
-  （`tools/probe-mobile.js`）
+  （`tools/probe-mobile.js`），真机日志也走到了最后一步
 - play 接口返回的片子下下来抽帧肉眼确认**无水印**：1080×1920、10,120,457 字节、无 logo 无账号水印
-- 45 个单测全绿，其中一条锁住「合成 JSON → 解析器」的字段契约
-- 还没在**真机**上跑过（本机没有 adb）。唯一剩下的不确定项是 Android WebView 里
-  播放器会不会正常初始化——`tools/probe-ch.js` 的用例 D 已用同版本内核复现过成功路径
+- 48 个单测全绿
+- 保存到相册走 MediaStore（Android 10+）+ `IS_PENDING`，写完才可见，相册里不会留半截文件
 
 ---
 

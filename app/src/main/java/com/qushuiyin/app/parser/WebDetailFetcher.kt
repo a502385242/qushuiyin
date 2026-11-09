@@ -70,7 +70,7 @@ import kotlin.coroutines.resume
 class WebDetailFetcher(
     context: Context,
     private val urlTemplate: String = DEFAULT_URL_TEMPLATE,
-    private val http: OkHttpClient = Http.client
+    private val http: OkHttpClient = Http.probeClient
 ) : DetailSource {
 
     private val appContext = context.applicationContext
@@ -129,23 +129,30 @@ class WebDetailFetcher(
         }
 
         /**
-         * 拿到 video_id，去 play 接口验一次再返回。
+         * 拿到 video_id 就出结果，**不再拿探测当门槛**。
          *
-         * 验一次的价值：video_id 可能是从页面里抠错了、或者片子已删，只有真发一个
-         * Range 请求才知道服务端认不认。验不过就退回复位，让后面的采样继续试。
+         * v0.4.1 的真机日志：video_id 在第 1 次采样就有，页面也开始播了，但一次只取
+         * 2 字节的 `Range` 探测在手机上要 23 秒才回来，整个解析在 25 秒超时先返回空。
+         * 也就是说数据早就取到了，是被一个**纯装饰性**的校验拖死的。
+         *
+         * 现在探测只是加分项：`PROBE_BUDGET_MS` 内回来就带上文件大小（UI 拿它当画质档位），
+         * 回不来就直接用页面给的 id 出结果。这个 id 来自页面播放器正在用的请求，
+         * 本身已经被证明可用，不需要我们再验一遍。
          */
         fun resolve(vid: String, page: PageInfo, by: String) {
             if (settled.get() || !resolving.compareAndSet(false, true)) return
             note("video_id($by): $vid")
             work.launch {
-                val probe = probePlay(vid)
-                if (probe == null) {
-                    note("play 接口没通过，继续等页面")
-                    resolving.set(false)
-                    return@launch
+                val probe = runCatching {
+                    withTimeoutOrNull(PROBE_BUDGET_MS) { probePlay(vid) }
+                }.getOrNull()
+                if (probe != null) {
+                    settle(buildDetailJson(awemeId, probe, page).toString(), "play 接口实测通过(${probe.label})")
+                } else {
+                    note("探测超过 ${PROBE_BUDGET_MS / 1000}s 预算，直接用页面给的 video_id 出结果")
+                    val fallback = Probe(playUrl(vid, PLAY_HOSTS.first()), 0L, "原始画质")
+                    settle(buildDetailJson(awemeId, fallback, page).toString(), "页面 video_id（未探测）")
                 }
-                val json = buildDetailJson(awemeId, probe, page).toString()
-                settle(json, "play 接口实测通过（${probe.label}）")
             }
         }
 
@@ -319,8 +326,11 @@ class WebDetailFetcher(
      * 总长度同时当作「档位」展示——它比分辨率好判断，也确实是画质的直接体现。
      */
     private fun probePlay(vid: String): Probe? {
+        // 两个域名轮流试，但整体不超过预算：第一个域名卡住时不能把第二个也拖成双倍耗时
+        val deadline = System.currentTimeMillis() + PROBE_BUDGET_MS
         for (host in PLAY_HOSTS) {
-            val url = "https://$host/aweme/v1/play/?video_id=$vid&ratio=1080p&line=0"
+            if (System.currentTimeMillis() >= deadline) break
+            val url = playUrl(vid, host)
             val req = Request.Builder()
                 .url(url)
                 .get()
@@ -341,6 +351,9 @@ class WebDetailFetcher(
         }
         return null
     }
+
+    private fun playUrl(vid: String, host: String): String =
+        "https://$host/aweme/v1/play/?video_id=$vid&ratio=1080p&line=0"
 
     private fun contentRangeTotal(header: String?): Long? {
         val v = header ?: return null
@@ -467,9 +480,14 @@ class WebDetailFetcher(
     }
 
     companion object {
-        private const val TIMEOUT_MS = 25_000L
+        /** 整条链路的兜底时限。正常 3~5 秒就出结果，这个只防死等 */
+        private const val TIMEOUT_MS = 30_000L
+
+        /** 探测 play 接口的预算。超了不报错，直接拿页面给的 video_id 出结果 */
+        private const val PROBE_BUDGET_MS = 7_000L
+
         private const val POLL_INTERVAL_MS = 1_200L
-        private const val MAX_POLLS = 12
+        private const val MAX_POLLS = 14
         private const val DESTROY_DELAY_MS = 500L
         private const val TRACE_MAX = 4_000
         private const val OFFSCREEN_GAP = 300

@@ -1,5 +1,10 @@
 package com.qushuiyin.app.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -18,6 +23,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -33,10 +39,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.qushuiyin.app.BuildConfig
 import com.qushuiyin.app.model.Aweme
@@ -47,7 +55,28 @@ import com.qushuiyin.app.parser.ParseError
 fun HomeScreen(vm: HomeViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
     val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     var showImport by remember { mutableStateOf(false) }
+
+    // Android 9 及以下要 WRITE_EXTERNAL_STORAGE 才能进相册，10 起走 MediaStore 不需要
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) vm.download() else vm.showToast("没有存储权限，无法保存到相册")
+    }
+
+    val startDownload: () -> Unit = {
+        val needPermission = Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) != PackageManager.PERMISSION_GRANTED
+        if (needPermission) {
+            permissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            vm.download()
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -139,7 +168,16 @@ fun HomeScreen(vm: HomeViewModel) {
                 )
             }
 
-            state.aweme?.let { ResultCard(it) }
+            state.aweme?.let { aweme ->
+                ResultCard(
+                    aweme = aweme,
+                    downloading = state.downloading,
+                    progress = state.downloadProgress,
+                    progressText = state.downloadText,
+                    savedTo = state.savedTo,
+                    onDownload = startDownload
+                )
+            }
 
             state.toast?.let {
                 Text(
@@ -260,7 +298,14 @@ private fun DiagnosticDialog(text: String, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun ResultCard(aweme: Aweme) {
+private fun ResultCard(
+    aweme: Aweme,
+    downloading: Boolean,
+    progress: Float?,
+    progressText: String?,
+    savedTo: String?,
+    onDownload: () -> Unit
+) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -281,25 +326,64 @@ private fun ResultCard(aweme: Aweme) {
                 text = if (aweme.isImagePost) {
                     "图文作品 · ${aweme.imageUrls.size} 张图"
                 } else {
-                    "视频 · ${aweme.videoUrls.size} 个清晰度可选"
+                    "视频 · 最高画质（无水印）"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            aweme.bestVideoUrl?.let {
+
+            Spacer(Modifier.height(4.dp))
+
+            Button(
+                onClick = onDownload,
+                enabled = !downloading,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                if (downloading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.height(16.dp).width(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
                 Text(
-                    text = it,
+                    when {
+                        downloading -> "保存中"
+                        aweme.isImagePost -> "保存 ${aweme.imageUrls.size} 张图到相册"
+                        else -> "保存视频到相册"
+                    }
+                )
+            }
+
+            if (downloading) {
+                // 总长未知（没有 Content-Length）时不传进度值，画成不确定态，
+                // 免得用户看到一根永远停在 0 的进度条以为卡死
+                if (progress != null) {
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+
+            if (downloading && !progressText.isNullOrBlank()) {
+                Text(
+                    text = progressText,
                     style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            Text(
-                text = "下载功能在下一阶段接入",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary
-            )
+
+            savedTo?.let {
+                Text(
+                    text = "已保存到相册：$it",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
         }
     }
 }

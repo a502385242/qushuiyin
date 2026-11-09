@@ -68,6 +68,22 @@ WebViewClient.shouldInterceptRequest 拿到完整 URL + 请求头（含 cookie/u
 403 / 空体 / `status_code != 0` 都分得开。接口路径写进了规则文件的 `detailApiPaths`，
 抖音换路径时推一份新规则就能救，不用发版。
 
+### 0.3.3 修的是「域名换成了 www-hj，ttwid 跟不过去」
+
+真机上详情接口实际走的是 `www-hj.douyin.com`，不是 `www.douyin.com`。
+而 `ttwid` 是 **host-only cookie**，只对种它的域名有效；页面请求跨到 `www-hj` 时
+浏览器不会带上它。抖音对缺 `ttwid` 的请求**不报错，只回 `200 + 0 字节`**。
+
+这一点是用留一法测出来的：拿一份能成功的 35 项 cookie，逐项删掉重发同一个请求，
+只有删掉 `ttwid` 会变成 0 字节，删掉其余 34 项都是正常的 74 KB
+（`tools/probe-cookie.js`）。同一份 query 打 `www` 和打 `www-hj` 结果一致，
+说明签名参数与域名无关（`tools/probe-host.js`）——所以修法是把 API 请求
+canonical 化回 `www.douyin.com`，并且优先读该域名下的 cookie。
+cookie 里彻底没有 `ttwid` 时，会先请求一次首页把 `Set-Cookie` 补回来。
+
+这个坑有个很迷惑的表象：`HTTP 200`、`content-type: application/json`、状态码一切正常，
+只是 body 长度为 0。看到「200 + 空体」先查 cookie，不要怀疑 UA 或签名。
+
 
 
 ---

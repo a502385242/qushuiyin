@@ -1,9 +1,13 @@
 {
-  "schemaVersion": 3,
-  "minAppVersion": 2,
+  "schemaVersion": 4,
+  "minAppVersion": 3,
   "sourceMode": "webview",
   "detailUrlTemplate": "https://www.douyin.com/video/{id}",
   "desktopUa": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "detailApiPaths": [
+    "/aweme/v1/web/aweme/detail/",
+    "/aweme/detail/"
+  ],
   "shareHosts": [
     "www.iesdouyin.com",
     "www.douyin.com"

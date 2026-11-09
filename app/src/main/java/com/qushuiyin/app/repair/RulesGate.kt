@@ -118,6 +118,11 @@ object RulesGate {
             return Decision.Reject("配置缺少必要字段（shareHosts / itemPaths / videoUrlPaths）")
         }
 
+        // webview 模式下靠 detailApiPaths 认接口，空了就永远截不到请求 —— 等于整份规则报废
+        if (rules.sourceMode == ParseRules.SOURCE_WEBVIEW && rules.detailApiPaths.isEmpty()) {
+            return Decision.Reject("webview 模式下 detailApiPaths 不能为空")
+        }
+
         if (rules.schemaVersion <= currentVersion) return Decision.NoUpdate
 
         return Decision.Accept(rules, text)

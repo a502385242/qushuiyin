@@ -39,7 +39,12 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         http = Http.client,
         // 每条规则都可能被热更新，所以按当前规则现造一个来源，而不是启动时固定下来
         detailSourceFactory = { rules ->
-            WebDetailFetcher(app, rules.detailUrlTemplate, rules.desktopUa)
+            WebDetailFetcher(
+                context = app,
+                urlTemplate = rules.detailUrlTemplate,
+                userAgent = rules.desktopUa,
+                apiPaths = rules.detailApiPaths
+            )
         }
     )
 

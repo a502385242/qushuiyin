@@ -27,6 +27,11 @@ data class ParseRules(
     val detailUrlTemplate: String = DEFAULT_DETAIL_URL,
     /** WebView 的 UA。**必须是桌面 UA**，移动 UA 只能拿到带水印的 720p */
     val desktopUa: String = DEFAULT_DESKTOP_UA,
+    /**
+     * 详情接口的 URL 片段。WebView 里命中这些片段的 GET 请求会被原样转发并读回响应体。
+     * 抖音换接口路径时，推一份新规则就能救回来，不用发版。
+     */
+    val detailApiPaths: List<String> = DEFAULT_API_PATHS,
     val shareHosts: List<String> = DEFAULT_HOSTS,
     val ua: String = DEFAULT_UA,
     /** 从根 JSON 到「单个作品对象」的候选路径 */
@@ -72,8 +77,15 @@ data class ParseRules(
 
         val DEFAULT_VIDEO_PATHS = listOf(
             "video.play_addr.url_list[0]",
-            "video.download_addr.url_list[0]",
             "video.playApi"
+            // 刻意不列 video.download_addr：它带 logo_name 参数，是**加了水印**的那条。
+            // 一旦放进候选，兜底逻辑就可能悄悄存下一条带水印的片子。
+        )
+
+        /** 详情接口候选片段，与 WebDetailFetcher.DEFAULT_API_PATHS 保持一致 */
+        val DEFAULT_API_PATHS = listOf(
+            "/aweme/v1/web/aweme/detail/",
+            "/aweme/detail/"
         )
 
         val DEFAULT_IMAGE_PATHS = listOf(

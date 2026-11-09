@@ -35,7 +35,7 @@ bash tools/release.sh 0.3.0 "一句话说明这版改了什么"
 | `aweme/v1/web/aweme/detail` 直接请求 | ❌ 403 `Blocked by ArgusSecurityPlugin Uifid Not Found` |
 | **桌面 UA 的真浏览器打开 `douyin.com/video/{id}`** | ✅ 页面自己带着 `a_bogus` 请求 `aweme/detail`，返回 **12 档清晰度** |
 
-所以取数方式改成了：**离屏 WebView + 桌面 UA + 拦截 `aweme/detail` 的响应**。
+所以取数方式改成了：**离屏 WebView + 桌面 UA + 在网络层把 `aweme/detail` 请求转发一次拿回响应**。
 让抖音自己的 JS 去算签名，我们只读结果——这样他们改签名算法时，跟着改的是他们，不是我们。
 
 这一条决定了两个不能动的实现细节：
@@ -45,6 +45,29 @@ bash tools/release.sh 0.3.0 "一句话说明这版改了什么"
    三个参数都是页面 JS 现场算的，复刻等于长期做逆向。
 
 代价是解析要 3~8 秒（有一个「正在通过网页加载作品」的进度提示）。
+
+### 0.3.0 修的是「钩子从来没生效」
+
+0.2.0 用 JS 钩子在 `onPageStarted` 里 `evaluateJavascript` 注入，看着能跑，
+实际**一次都没生效**：那一刻新文档还没创建，脚本执行在旧文档的上下文里，页面一换就没了。
+表现就是不管换哪条链接都提示「页面结构有变化」。
+
+0.3.0 不再依赖注入时机，改成旁观网络请求：
+
+```
+页面 JS 算出 a_bogus → 发出 GET /aweme/v1/web/aweme/detail/...
+        ↓
+WebViewClient.shouldInterceptRequest 拿到完整 URL + 请求头（含 cookie/uifid）
+        ↓
+用 OkHttp 原样转发一次（不带 Accept-Encoding，由 OkHttp 解 gzip）
+        ↓
+响应体同时交给上层解析 + 原样返回给 WebView，页面无感
+```
+
+这个做法还有个额外好处：以前只能靠「猜」判断失败原因，现在能拿到真实响应，
+403 / 空体 / `status_code != 0` 都分得开。接口路径写进了规则文件的 `detailApiPaths`，
+抖音换路径时推一份新规则就能救，不用发版。
+
 
 
 ---
@@ -62,7 +85,8 @@ bash tools/release.sh 0.3.0 "一句话说明这版改了什么"
 **验证到什么程度**：
 - 真实分享链接跑通了全链路（短链 → 作品 ID → 桌面页 → 详情 JSON → 12 档清晰度）
 - 最高档 1080×1920 流下载后抽帧肉眼确认**无水印**，字节数与接口给的 `data_size` 完全一致
-- 拦截脚本（`HOOK_JS`）在真 Chrome 里验证过能截到 73 KB 响应
+- 「转发请求」这条路在真 Chrome 里单独验过：把页面自己发出的 detail 请求连同 Cookie
+  在页面之外重发一次，同样返回 200 + 12 档（`tools/probe-forward.js`）
 - 还没在**真机**上跑过（本机没有 adb），WebView 环节是唯一剩下的不确定项
 
 ---
@@ -97,7 +121,8 @@ sdk.dir=D:/devtools/android-sdk
 
 ```
 app/src/main/java/com/qushuiyin/app/
-├── parser/     WebDetailFetcher 离屏 WebView 取数（钩 XHR/fetch）
+├── parser/     WebDetailFetcher 离屏 WebView 取数（shouldInterceptRequest 转发请求）
+│               DetailApiMatcher 接口匹配（纯 JVM，可单测）
 │               DetailSource 取数接口 · DouyinParser 解析主流程
 │               LinkParser 链接抽取 · JsonPath 候选路径 · HtmlExtractor 抠 JSON
 │               ParseRules 规则结构 · ParseError 错误分类

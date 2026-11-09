@@ -18,6 +18,9 @@ class RulesGateTest {
     private val sigFile = File("../config/manifest.json.sig")
     private val pubFile = File("../keys/public.b64")
 
+    /** 与当前 App 的 versionCode 对齐：规则文件的 minAppVersion 就是按它定的 */
+    private val APP_VER = 3
+
     private fun ready(): Boolean = manifest.exists() && sigFile.exists() && pubFile.exists()
     private fun pub(): String = pubFile.readText().trim()
     private fun raw(): ByteArray = manifest.readBytes()
@@ -27,11 +30,11 @@ class RulesGateTest {
     fun `真实规则文件能通过校验并被采用`() {
         assumeTrue("本地未生成密钥，跳过", ready())
 
-        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 2, currentVersion = 1)
+        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = APP_VER, currentVersion = 3)
         assertTrue("应被采用，实际是 $d", d is RulesGate.Decision.Accept)
 
         val accepted = d as RulesGate.Decision.Accept
-        assertEquals("manifest 的版本号被读错", 3, accepted.rules.schemaVersion)
+        assertEquals("manifest 的版本号被读错", 4, accepted.rules.schemaVersion)
         assertTrue("候选路径没解析出来", accepted.rules.itemPaths.isNotEmpty())
         assertTrue("规则原文应原样保留，供下次启动复用", accepted.text.contains("itemPaths"))
         assertEquals(
@@ -39,13 +42,17 @@ class RulesGateTest {
             "webview",
             accepted.rules.sourceMode
         )
+        assertTrue(
+            "webview 模式下 detailApiPaths 是截获详情的唯一依据，不能为空",
+            accepted.rules.detailApiPaths.isNotEmpty()
+        )
     }
 
     @Test
     fun `版本不比本地新时返回 NoUpdate 而不是报错`() {
         assumeTrue("本地未生成密钥，跳过", ready())
 
-        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 2, currentVersion = 3)
+        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = APP_VER, currentVersion = 4)
         assertEquals(RulesGate.Decision.NoUpdate, d)
     }
 
@@ -53,8 +60,8 @@ class RulesGateTest {
     fun `App 版本低于规则要求时拒绝并要求升级`() {
         assumeTrue("本地未生成密钥，跳过", ready())
 
-        // minAppVersion = 2，把 App 版本压到 1 就能触发这条分支
-        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 1, currentVersion = 1)
+        // minAppVersion = 3，把 App 版本压到 2 就能触发这条分支
+        val d = RulesGate.evaluate(raw(), sig(), pub(), appVersionCode = 2, currentVersion = 1)
         assertTrue("应当是拒绝，实际是 $d", d is RulesGate.Decision.Reject)
         val reason = (d as RulesGate.Decision.Reject).reason
         assertTrue("提示里应告诉用户去升级 App，实际是：$reason", reason.contains("版本"))
@@ -67,7 +74,7 @@ class RulesGateTest {
         val tampered = raw().copyOf().also {
             it[it.size / 3] = (it[it.size / 3] + 1).toByte()
         }
-        val d = RulesGate.evaluate(tampered, sig(), pub(), appVersionCode = 1, currentVersion = 1)
+        val d = RulesGate.evaluate(tampered, sig(), pub(), appVersionCode = 2, currentVersion = 1)
         assertTrue("篡改后竟然被采用", d is RulesGate.Decision.Reject)
         val reason = (d as RulesGate.Decision.Reject).reason
         assertTrue("拒绝理由应指向签名而不是别的，实际是：$reason", reason.contains("签名"))
@@ -77,13 +84,13 @@ class RulesGateTest {
     fun `没内置公钥时一律不采用远程规则`() {
         assumeTrue("本地未生成密钥，跳过", ready())
 
-        val d = RulesGate.evaluate(raw(), sig(), publicKeyB64 = "", appVersionCode = 1, currentVersion = 1)
+        val d = RulesGate.evaluate(raw(), sig(), publicKeyB64 = "", appVersionCode = 2, currentVersion = 1)
         assertTrue("没公钥竟然还能采用，等于热修复后门", d is RulesGate.Decision.Reject)
     }
 
     @Test
     fun `空内容被拒绝`() {
-        val d = RulesGate.evaluate(ByteArray(0), "AAAA", pub(), appVersionCode = 1, currentVersion = 0)
+        val d = RulesGate.evaluate(ByteArray(0), "AAAA", pub(), appVersionCode = 2, currentVersion = 0)
         assertTrue(d is RulesGate.Decision.Reject)
     }
 
@@ -115,11 +122,11 @@ class RulesGateTest {
             RulesGate.Candidate(staleRaw(), staleSig(), "jsdelivr(旧缓存)"),
             RulesGate.Candidate(raw(), sig(), "raw")
         )
-        val choice = RulesGate.choose(candidates, pub(), appVersionCode = 2, currentVersion = 2)
+        val choice = RulesGate.choose(candidates, pub(), appVersionCode = APP_VER, currentVersion = 2)
 
         assertTrue("应当选中新规则，实际 $choice", choice is RulesGate.Choice.Repaired)
         val repaired = choice as RulesGate.Choice.Repaired
-        assertEquals("必须选版本号高的那份", 3, repaired.rules.schemaVersion)
+        assertEquals("必须选版本号高的那份", 4, repaired.rules.schemaVersion)
         assertEquals("raw", repaired.source)
     }
 
@@ -131,8 +138,8 @@ class RulesGateTest {
             RulesGate.Candidate(raw(), sig(), "raw"),
             RulesGate.Candidate(staleRaw(), staleSig(), "jsdelivr(旧缓存)")
         )
-        val choice = RulesGate.choose(reversed, pub(), appVersionCode = 2, currentVersion = 2)
-        assertEquals(3, (choice as RulesGate.Choice.Repaired).rules.schemaVersion)
+        val choice = RulesGate.choose(reversed, pub(), appVersionCode = APP_VER, currentVersion = 2)
+        assertEquals(4, (choice as RulesGate.Choice.Repaired).rules.schemaVersion)
     }
 
     @Test
@@ -142,7 +149,7 @@ class RulesGateTest {
         val choice = RulesGate.choose(
             listOf(RulesGate.Candidate(staleRaw(), staleSig(), "cdn")),
             pub(),
-            appVersionCode = 2,
+            appVersionCode = APP_VER,
             currentVersion = 2
         )
         assertEquals(RulesGate.Choice.NoUpdate, choice)
@@ -158,7 +165,7 @@ class RulesGateTest {
                 RulesGate.Candidate(staleRaw(), "BBBB", "b")
             ),
             pub(),
-            appVersionCode = 2,
+            appVersionCode = APP_VER,
             currentVersion = 2
         )
         assertTrue(choice is RulesGate.Choice.Rejected)

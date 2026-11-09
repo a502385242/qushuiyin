@@ -27,6 +27,8 @@ data class HomeUiState(
     val stage: String? = null,
     val aweme: Aweme? = null,
     val error: ParseError? = null,
+    /** 解析失败时的取证记录，来自 WebDetailFetcher。用户手机上没 adb，这是唯一能看到病因的途径 */
+    val diagnostic: String? = null,
     /** 正在拉规则，UI 上按钮转圈 */
     val repairing: Boolean = false,
     /** 一次性提示，展示后清空 */
@@ -34,6 +36,13 @@ data class HomeUiState(
 )
 
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
+
+    /**
+     * 最近一次取数用的来源实例。
+     * 每次解析都按当前规则新建一个，这里只是留个引用，好在失败时把它的 [WebDetailFetcher.trace] 取出来。
+     */
+    @Volatile
+    private var lastSource: WebDetailFetcher? = null
 
     private val parser = DouyinParser(
         http = Http.client,
@@ -44,7 +53,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                 urlTemplate = rules.detailUrlTemplate,
                 userAgent = rules.desktopUa,
                 apiPaths = rules.detailApiPaths
-            )
+            ).also { lastSource = it }
         }
     )
 
@@ -84,7 +93,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         viewModelScope.launch {
-            _state.update { it.copy(parsing = true, error = null, aweme = null, stage = null) }
+            lastSource = null
+            _state.update {
+                it.copy(parsing = true, error = null, aweme = null, stage = null, diagnostic = null)
+            }
             when (val r = parser.parse(target) { stage ->
                 _state.update { it.copy(stage = stage) }
             }) {
@@ -93,7 +105,14 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     prefetchRulesQuietly()
                 }
                 is DouyinParser.ParseResult.Fail ->
-                    _state.update { it.copy(parsing = false, error = r.error, stage = null) }
+                    _state.update {
+                        it.copy(
+                            parsing = false,
+                            error = r.error,
+                            stage = null,
+                            diagnostic = lastSource?.trace
+                        )
+                    }
             }
         }
     }
@@ -193,7 +212,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun retryAfterRepair() {
         val target = LinkParser.parse(_state.value.input) ?: return
-        _state.update { it.copy(parsing = true, error = null, aweme = null, stage = null) }
+        lastSource = null
+        _state.update {
+            it.copy(parsing = true, error = null, aweme = null, stage = null, diagnostic = null)
+        }
         when (val r = parser.parse(target) { stage -> _state.update { it.copy(stage = stage) } }) {
             is DouyinParser.ParseResult.Ok ->
                 _state.update { it.copy(parsing = false, aweme = r.aweme, stage = null, toast = null) }
@@ -203,6 +225,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                         parsing = false,
                         error = r.error,
                         stage = null,
+                        diagnostic = lastSource?.trace,
                         toast = "换了新规则仍然解析不了，可以复制诊断信息反馈"
                     )
                 }

@@ -33,9 +33,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.qushuiyin.app.BuildConfig
 import com.qushuiyin.app.model.Aweme
 import com.qushuiyin.app.parser.ParseError
 
@@ -47,7 +50,21 @@ fun HomeScreen(vm: HomeViewModel) {
     var showImport by remember { mutableStateOf(false) }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("去水印") }) }
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text("去水印")
+                        // 版本号必须常显：用户判断「到底有没有装上更新」只靠这一行
+                        Text(
+                            text = "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            )
+        }
     ) { padding ->
         Column(
             modifier = Modifier
@@ -116,6 +133,7 @@ fun HomeScreen(vm: HomeViewModel) {
                 ErrorCard(
                     error = error,
                     repairing = state.repairing,
+                    diagnostic = state.diagnostic,
                     onRepair = vm::repair,
                     onRetry = vm::parse
                 )
@@ -154,9 +172,12 @@ fun HomeScreen(vm: HomeViewModel) {
 private fun ErrorCard(
     error: ParseError,
     repairing: Boolean,
+    diagnostic: String?,
     onRepair: () -> Unit,
     onRetry: () -> Unit
 ) {
+    var showDiagnostic by remember { mutableStateOf(false) }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -172,7 +193,10 @@ private fun ErrorCard(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onErrorContainer
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 // 只有「页面结构变了」才给修复按钮，避免误导
                 if (error.canRepair) {
                     Button(onClick = onRepair, enabled = !repairing) {
@@ -190,9 +214,49 @@ private fun ErrorCard(
                 if (error.canRetry && !error.canRepair) {
                     TextButton(onClick = onRetry) { Text("重试") }
                 }
+                Spacer(Modifier.weight(1f))
+                // 手机上没法抓 logcat，这段记录就是唯一能拿到的现场
+                if (!diagnostic.isNullOrBlank()) {
+                    TextButton(onClick = { showDiagnostic = true }) { Text("诊断信息") }
+                }
             }
         }
     }
+
+    if (showDiagnostic && !diagnostic.isNullOrBlank()) {
+        DiagnosticDialog(text = diagnostic, onDismiss = { showDiagnostic = false })
+    }
+}
+
+@Composable
+private fun DiagnosticDialog(text: String, onDismiss: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("诊断信息") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                clipboard.setText(AnnotatedString(text))
+                onDismiss()
+            }) { Text("复制") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("关闭") }
+        }
+    )
 }
 
 @Composable

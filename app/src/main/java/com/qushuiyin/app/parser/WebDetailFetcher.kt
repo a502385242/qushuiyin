@@ -89,12 +89,15 @@ class WebDetailFetcher(
 
     override suspend fun fetch(awemeId: String): String? {
         note("ua: " + systemWebViewVersion())
-        return withTimeoutOrNull(TIMEOUT_MS) {
-            withContext(Dispatchers.Main) { load(awemeId) }
-        } ?: run {
-            note("done: 超时 ${TIMEOUT_MS / 1000}s，页面没给出 video_id")
-            null
+        // 区分「超时」和「页面自己报了错返回 null」：这两件事原因完全不同，
+        // 混在一起记会误导排查（0.4.0 就因此把失败记成了「超时」）。
+        var returned = false
+        val r = withTimeoutOrNull(TIMEOUT_MS) {
+            withContext(Dispatchers.Main) { load(awemeId) }.also { returned = true }
         }
+        if (r != null) return r
+        if (!returned) note("done: 超时 ${TIMEOUT_MS / 1000}s，页面没给出 video_id")
+        return null
     }
 
     private fun systemWebViewVersion(): String = runCatching {
@@ -133,7 +136,7 @@ class WebDetailFetcher(
          */
         fun resolve(vid: String, page: PageInfo, by: String) {
             if (settled.get() || !resolving.compareAndSet(false, true)) return
-            note("video_id($by): ${vid.take(24)}")
+            note("video_id($by): $vid")
             work.launch {
                 val probe = probePlay(vid)
                 if (probe == null) {
@@ -209,6 +212,36 @@ class WebDetailFetcher(
             }
 
             /**
+             * 拦掉一切非 http(s) 跳转。
+             *
+             * 真机日志里，页面拿到 video_id 后会用 `snssdk1128://aweme/detail/...`
+             * 去唤起抖音 App。我们不是 App，这个跳转必然失败（ERR_UNKNOWN_URL_SCHEME），
+             * 而它会走 `onReceivedError` 且 `isForMainFrame == true`，0.4.0 因此把
+             * 一次**即将成功**的解析判定成「主页加载失败」直接结束。
+             *
+             * 返回 true = WebView 不执行这次跳转，页面留在原地继续播，采样也不中断。
+             */
+            override fun shouldOverrideUrlLoading(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): Boolean {
+                val url = request?.url?.toString().orEmpty()
+                val httpish = url.startsWith("http://", true) || url.startsWith("https://", true)
+                if (!httpish) {
+                    note("拦下非 http 跳转: ${url.take(90)}")
+                    return true
+                }
+                // http(s) 也只在同站内放行，避免页面把我们带去广告落地页
+                val sameSite = runCatching { request?.url?.host?.contains("douyin.com") == true }
+                    .getOrDefault(false)
+                if (!sameSite) {
+                    note("拦下出站跳转: ${url.take(90)}")
+                    return true
+                }
+                return false
+            }
+
+            /**
              * 抢跑：播放器一定会去请求 `.../playwm/?...&video_id=xxx`，
              * 这条请求比 DOM 里出现 `<video src>` 更早，从这里直接薅出 video_id 最快。
              * 注意只取 id，**不用它返回的地址**——`playwm` 是带水印的那条。
@@ -247,9 +280,17 @@ class WebDetailFetcher(
                 request: WebResourceRequest?,
                 error: WebResourceError?
             ) {
-                if (request?.isForMainFrame == true) {
-                    note("主页加载失败: ${error?.errorCode} ${error?.description}")
+                if (request?.isForMainFrame != true) return
+                val url = request.url?.toString().orEmpty()
+                note("主页加载失败: ${error?.errorCode} ${error?.description} @ ${url.take(70)}")
+                // 只有「目标页面本身打不开」才算致命。自定义 scheme（snssdk1128:// 等）
+                // 是页面在尝试唤起 App，和取数无关，绝不能据此放弃。
+                val schemeBroken = error?.errorCode == WebViewClient.ERROR_UNSUPPORTED_SCHEME ||
+                    !url.startsWith("http", ignoreCase = true)
+                if (!schemeBroken) {
                     settle(null, "主页加载失败")
+                } else {
+                    note("忽略：非页面级错误，继续等 video_id")
                 }
             }
         }

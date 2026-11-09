@@ -25,11 +25,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayInputStream
+import java.io.IOException
+import java.util.Collections
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
@@ -72,6 +76,9 @@ class WebDetailFetcher(
     }
 
     private val sb = StringBuilder()
+
+    /** 已经处理过的详情 URL。页面内 fetch 自己也会再走一遍 shouldInterceptRequest，不去重会打转 */
+    private val fired: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
     /** 给 UI 看的取证记录。多线程写入（网络线程 / 主线程 / JS 回调），必须加锁 */
     val trace: String get() = synchronized(sb) { sb.toString() }
@@ -123,6 +130,41 @@ class WebDetailFetcher(
             view?.evaluateJavascript(HOOK_JS, null)
         }
 
+        /**
+         * 自己用 OkHttp 转发。
+         *
+         * 成败取决于能不能带上 cookie——真机上 `CookieManager.getCookie()` 在
+         * shouldInterceptRequest 的后台线程里常返回空，服务端于是回 200 空体。
+         * 所以这个函数要求调用方**在主线程先取好 cookie** 再传进来。
+         */
+        fun forwardFallback(url: String, cookie: String?) {
+            val req = Request.Builder()
+                .url(url)
+                .get()
+                .header("User-Agent", userAgent)
+                .header("Accept", "application/json, text/plain, */*")
+                .header("Referer", "https://www.douyin.com/")
+                .apply { cookie?.takeIf { it.isNotBlank() }?.let { header("Cookie", it) } }
+                .build()
+            runCatching {
+                forwardClient.newCall(req).enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        note("转发异常: ${e.javaClass.simpleName} ${e.message?.take(60)}")
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        response.use {
+                            val body = it.body?.string()
+                            note("转发 HTTP ${it.code}, ${body?.length ?: 0} 字节")
+                            if (!body.isNullOrBlank() && body.contains(DETAIL_KEY)) {
+                                settle(body, "OkHttp 转发")
+                            }
+                        }
+                    }
+                })
+            }.onFailure { note("转发发起失败: ${it.javaClass.simpleName}") }
+        }
+
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -152,8 +194,16 @@ class WebDetailFetcher(
             }
 
             /**
-             * 主入口：页面发 `/aweme/detail` 时截住它，用页面自己算好的 URL 与请求头
-             * 转发一次，把响应体同时交给上层和 WebView。
+             * 命中详情接口时**不接管**这次请求，只借它的 URL 在页面里重新请求一次。
+             *
+             * 为什么不能自己用 OkHttp 转发：真机诊断实测，转发拿到的是 `HTTP 200 + 0 字节`，
+             * 而同一台手机上用浏览器打开一切正常。对照实验（tools/probe-ua.js）证明
+             * 唯一会触发空体的是**没有 Cookie**——UA 与 sec-ch-ua 版本不一致都不影响。
+             * `CookieManager.getCookie()` 在 shouldInterceptRequest 的后台线程里经常拿到空值，
+             * 而 WebView 网络栈自己发请求时会自动带上 cookie。
+             *
+             * 所以改成在**页面上下文**里 fetch 同一个 URL：同源、凭据自动携带、
+             * Referer 天然正确，服务端就当它是页面自己发的。
              */
             override fun shouldInterceptRequest(
                 view: WebView?,
@@ -163,18 +213,33 @@ class WebDetailFetcher(
                 val url = request.url?.toString() ?: return null
                 if (!matchesDetailApi(url)) return null
 
-                val body = forward(url, request.requestHeaders)
-                if (body == null) {
-                    note("命中详情接口但转发失败，交还 WebView 自己发")
-                    return null
+                note("命中详情接口: ${url.take(110)}")
+                // 同一个 URL 只处理一次：我们自己发的请求也会再走一遍这里，不去重会打转
+                if (fired.add(url) && view != null) {
+                    view.post {
+                        if (settled.get()) return@post
+                        /*
+                         * 两条路同时走，谁先拿到带 aweme_detail 的响应就用谁。
+                         *
+                         * 为什么要两条：真机实测两条路各有一个坑——
+                         *  - OkHttp 自己发：后台线程里 CookieManager 常返回空，服务端回 200 空体；
+                         *  - 页面内 fetch：同源同 cookie，但可能被页面的 Service Worker 拦下，
+                         *    返回的是 SPA 的 HTML 外壳（实测 84 万字节，不含任何作品数据）。
+                         * 单押任何一条都可能失败，两条并行才稳。
+                         */
+                        val cookie = runCatching {
+                            CookieManager.getInstance().getCookie(url)
+                        }.getOrNull()
+                        note("主线程读 Cookie 长度: ${cookie?.length ?: 0}")
+                        forwardFallback(url, cookie)
+                        if (!settled.get()) {
+                            note("页面内 fetch 同一 URL")
+                            view.evaluateJavascript(jsFetchDetail(url), null)
+                        }
+                    }
                 }
-                note("转发成功: ${body.length} 字节, 含作品=${body.contains(DETAIL_KEY)}")
-                if (body.contains(DETAIL_KEY)) settle(body, "网络层转发")
-                return WebResourceResponse(
-                    "application/json",
-                    "utf-8",
-                    ByteArrayInputStream(body.toByteArray(Charsets.UTF_8))
-                )
+                // 返回 null = 不拦截，页面自己那次请求照常进行，页面不会因为我们而变空
+                return null
             }
 
             override fun onPageCommitVisible(view: WebView?, url: String?) = inject(view)
@@ -286,49 +351,29 @@ class WebDetailFetcher(
         DetailApiMatcher.matches(url, apiPaths)
 
     /**
-     * 用页面自己的 URL + 请求头再发一次，读回响应体。
+     * 在页面上下文里重新请求同一个详情 URL。
      *
-     * 关键点：
-     *  - **不能带 `Accept-Encoding`**：交给 OkHttp 自己协商，它会顺带把 gzip 解掉，
-     *    我们拿到的是明文，返回给 WebView 时也就不用再声明编码。
-     *  - `Cookie` 优先取请求头里的（和 WebView 当期状态一致），没有再问 CookieManager。
-     *  - 上游非 2xx 或空体时返回 null，把这次请求还给 WebView 自己发，
-     *    免得我们的转发结果把页面带崩。
+     * 这是整条链路的关键：页面内 fetch 由 WebView 网络栈发出，cookie / Referer /
+     * 同源身份全部天然正确，服务端就把它当成页面自己的请求。
+     *
+     * 而用 OkHttp 自己发时，`CookieManager.getCookie()` 在后台线程经常返回空，
+     * 服务端于是回 `200 + 空体`（对照实验见 tools/probe-ua.js：唯一触发空体的条件
+     * 就是没有 cookie，UA 与 sec-ch-ua 版本不一致都不影响）。
      */
-    private fun forward(url: String, headers: Map<String, String>): String? {
-        fun header(name: String): String? =
-            headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
-
-        val builder = Request.Builder()
-            .url(url)
-            .get()
-            .header("Accept", header("Accept") ?: "application/json, text/plain, */*")
-            .header("User-Agent", header("User-Agent") ?: userAgent)
-
-        header("Referer")?.takeIf { it.isNotBlank() }?.let { builder.header("Referer", it) }
-        (header("Cookie") ?: CookieManager.getInstance().getCookie(url))
-            ?.takeIf { it.isNotBlank() }
-            ?.let { builder.header("Cookie", it) }
-
-        // 抖音会看 uifid / sec-ch-ua / x-secsdk-web-signature 这些头，能带就带
-        headers.forEach { (k, v) ->
-            val key = k.lowercase()
-            if (key !in SKIPPED_HEADERS && v.isNotBlank()) {
-                runCatching { builder.header(k, v) }
-            }
-        }
-
-        return try {
-            forwardClient.newCall(builder.build()).execute().use { resp ->
-                val body = resp.body?.string()
-                note("转发 HTTP ${resp.code}, ${body?.length ?: 0} 字节")
-                if (!resp.isSuccessful) null else body?.takeIf { it.isNotBlank() }
-            }
-        } catch (e: Exception) {
-            note("转发异常: ${e.javaClass.simpleName} ${e.message?.take(80)}")
-            null
-        }
-    }
+    private fun jsFetchDetail(url: String): String = """
+        (function () {
+          try {
+            fetch(${JSONObject.quote(url)}, {
+              credentials: 'include',
+              headers: { 'Accept': 'application/json, text/plain, */*' }
+            }).then(function (r) { return r.text(); })
+              .then(function (t) {
+                if (t && t.indexOf('aweme_detail') >= 0) window.$BRIDGE_NAME.onDetail(t);
+              })
+              .catch(function (e) {});
+          } catch (e) {}
+        })();
+    """.trimIndent()
 
     /**
      * 读 `<video src>` 作为最后手段。包成与详情接口同构的 JSON，
@@ -379,12 +424,6 @@ class WebDetailFetcher(
         val DEFAULT_API_PATHS = listOf(
             "/aweme/v1/web/aweme/detail/",
             "/aweme/detail/"
-        )
-
-        /** OkHttp 不允许手工设置的头，以及会让响应体被二次编码的头 */
-        private val SKIPPED_HEADERS = setOf(
-            "host", "connection", "content-length", "accept-encoding",
-            "transfer-encoding", "upgrade", "cookie", "user-agent", "accept"
         )
 
         /**

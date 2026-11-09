@@ -21,18 +21,17 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.qushuiyin.app.App
 import com.qushuiyin.app.core.Http
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.IOException
 import java.util.Collections
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -77,8 +76,14 @@ class WebDetailFetcher(
 
     private val sb = StringBuilder()
 
+    /** 转发/补 cookie 都在 IO 线程做，主线程只负责读 cookie 和改 WebView */
+    private val work = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     /** 已经处理过的详情 URL。页面内 fetch 自己也会再走一遍 shouldInterceptRequest，不去重会打转 */
     private val fired: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
+    /** 页面重试时会连续发好几次详情请求，超过次数就停手，别把请求打成风暴 */
+    private val attempts = java.util.concurrent.atomic.AtomicInteger(0)
 
     /** 给 UI 看的取证记录。多线程写入（网络线程 / 主线程 / JS 回调），必须加锁 */
     val trace: String get() = synchronized(sb) { sb.toString() }
@@ -131,38 +136,49 @@ class WebDetailFetcher(
         }
 
         /**
-         * 自己用 OkHttp 转发。
+         * 自己转发一次。
          *
-         * 成败取决于能不能带上 cookie——真机上 `CookieManager.getCookie()` 在
-         * shouldInterceptRequest 的后台线程里常返回空，服务端于是回 200 空体。
-         * 所以这个函数要求调用方**在主线程先取好 cookie** 再传进来。
+         * 0.3.3 的关键修正：转发**必须打 canonical 域名（www.douyin.com）**。
+         * 真机日志里详情接口走的是 `www-hj.douyin.com`，而抖音把 `ttwid` 这个
+         * host-only cookie 种在 `www.douyin.com` 上——跨到 `www-hj` 就带不过去，
+         * 服务端于是回 `200 + 0 字节`。对照实验见 tools/probe-cookie.js：
+         * 35 项 cookie 留一法测试，只有去掉 ttwid 会挂，其余都不影响。
          */
-        fun forwardFallback(url: String, cookie: String?) {
-            val req = Request.Builder()
-                .url(url)
-                .get()
-                .header("User-Agent", userAgent)
-                .header("Accept", "application/json, text/plain, */*")
-                .header("Referer", "https://www.douyin.com/")
-                .apply { cookie?.takeIf { it.isNotBlank() }?.let { header("Cookie", it) } }
-                .build()
-            runCatching {
-                forwardClient.newCall(req).enqueue(object : Callback {
-                    override fun onFailure(call: Call, e: IOException) {
-                        note("转发异常: ${e.javaClass.simpleName} ${e.message?.take(60)}")
+        fun forward(target: String, cookie: String, by: String) {
+            work.launch {
+                var ck = cookie
+                if (!ck.contains(TTWID_KEY)) {
+                    note("Cookie 缺 ttwid，补一次")
+                    val t = bootstrapTtwid()
+                    if (t != null) {
+                        ck = if (ck.isBlank()) t else "$ck; $t"
+                        note("已补 ttwid ${t.length}B")
+                    } else {
+                        note("补 ttwid 失败")
                     }
-
-                    override fun onResponse(call: Call, response: Response) {
-                        response.use {
-                            val body = it.body?.string()
-                            note("转发 HTTP ${it.code}, ${body?.length ?: 0} 字节")
-                            if (!body.isNullOrBlank() && body.contains(DETAIL_KEY)) {
-                                settle(body, "OkHttp 转发")
-                            }
+                }
+                val req = Request.Builder()
+                    .url(target)
+                    .get()
+                    .header("User-Agent", userAgent)
+                    .header("Accept", "application/json, text/plain, */*")
+                    .header("Accept-Language", "zh-CN,zh;q=0.9")
+                    .header("Referer", "https://$CANONICAL_HOST/")
+                    .apply { if (ck.isNotBlank()) header("Cookie", ck) }
+                    .build()
+                runCatching {
+                    forwardClient.newCall(req).execute().use { resp ->
+                        val body = resp.body?.string()
+                        note("$by -> ${hostOf(target)} HTTP ${resp.code}, ${body?.length ?: 0} 字节")
+                        if (!body.isNullOrBlank() && body.contains(DETAIL_KEY)) {
+                            settle(body, by)
+                        } else if (!body.isNullOrBlank()) {
+                            // 有响应但没作品对象：把开头记下来，能区分「需要登录」「作品不存在」「被风控」
+                            note("$by 返回内容: " + body.take(120).replace('\n', ' '))
                         }
                     }
-                })
-            }.onFailure { note("转发发起失败: ${it.javaClass.simpleName}") }
+                }.onFailure { note("$by 异常: ${it.javaClass.simpleName} ${it.message?.take(60)}") }
+            }
         }
 
         webView.settings.apply {
@@ -183,6 +199,12 @@ class WebDetailFetcher(
                 fun onDetail(json: String) {
                     if (json.isNotBlank()) settle(json, "JS 钩子")
                 }
+
+                /** 页面内 fetch 的中间结果只有这里能看见，失败时必须能看出它拿到的是空体还是 HTML */
+                @JavascriptInterface
+                fun onProbe(msg: String) {
+                    note(msg.take(120))
+                }
             },
             BRIDGE_NAME
         )
@@ -194,16 +216,18 @@ class WebDetailFetcher(
             }
 
             /**
-             * 命中详情接口时**不接管**这次请求，只借它的 URL 在页面里重新请求一次。
+             * 命中详情接口时**不接管**这次请求，只借它的 URL 自己去请求一次。
              *
-             * 为什么不能自己用 OkHttp 转发：真机诊断实测，转发拿到的是 `HTTP 200 + 0 字节`，
-             * 而同一台手机上用浏览器打开一切正常。对照实验（tools/probe-ua.js）证明
-             * 唯一会触发空体的是**没有 Cookie**——UA 与 sec-ch-ua 版本不一致都不影响。
-             * `CookieManager.getCookie()` 在 shouldInterceptRequest 的后台线程里经常拿到空值，
-             * 而 WebView 网络栈自己发请求时会自动带上 cookie。
+             * 为什么不接管：页面自己那次请求是算好签名的，接管后我们得替它发，
+             * 一旦失败页面就彻底白屏，连兜底的 `<video>` 都读不到。
              *
-             * 所以改成在**页面上下文**里 fetch 同一个 URL：同源、凭据自动携带、
-             * Referer 天然正确，服务端就当它是页面自己发的。
+             * 0.3.3 的核心修正——**域名要换回 canonical 的 www.douyin.com**：
+             * 真机日志显示详情接口走 `www-hj.douyin.com`，而 `ttwid` 是 host-only
+             * 种在 `www.douyin.com` 上的，跨到 `www-hj` 就带不过去。抖音对没有
+             * ttwid 的请求不报错，只回 `200 + 0 字节`（实测 35 项 cookie 留一法，
+             * 只有 ttwid 是必需的，见 tools/probe-cookie.js）。
+             * 签名（a_bogus）只跟路径和 query 有关，与域名无关——同一份 query
+             * 打 www 和打 www-hj 都能通，前提是 cookie 带全。
              */
             override fun shouldInterceptRequest(
                 view: WebView?,
@@ -213,29 +237,23 @@ class WebDetailFetcher(
                 val url = request.url?.toString() ?: return null
                 if (!matchesDetailApi(url)) return null
 
-                note("命中详情接口: ${url.take(110)}")
-                // 同一个 URL 只处理一次：我们自己发的请求也会再走一遍这里，不去重会打转
-                if (fired.add(url) && view != null) {
-                    view.post {
-                        if (settled.get()) return@post
-                        /*
-                         * 两条路同时走，谁先拿到带 aweme_detail 的响应就用谁。
-                         *
-                         * 为什么要两条：真机实测两条路各有一个坑——
-                         *  - OkHttp 自己发：后台线程里 CookieManager 常返回空，服务端回 200 空体；
-                         *  - 页面内 fetch：同源同 cookie，但可能被页面的 Service Worker 拦下，
-                         *    返回的是 SPA 的 HTML 外壳（实测 84 万字节，不含任何作品数据）。
-                         * 单押任何一条都可能失败，两条并行才稳。
-                         */
-                        val cookie = runCatching {
-                            CookieManager.getInstance().getCookie(url)
-                        }.getOrNull()
-                        note("主线程读 Cookie 长度: ${cookie?.length ?: 0}")
-                        forwardFallback(url, cookie)
-                        if (!settled.get()) {
-                            note("页面内 fetch 同一 URL")
-                            view.evaluateJavascript(jsFetchDetail(url), null)
-                        }
+                note("命中详情接口: ${hostOf(url)}")
+                if (view == null || !fired.add(url)) return null
+                if (attempts.incrementAndGet() > MAX_ATTEMPTS) {
+                    note("详情请求已发 $MAX_ATTEMPTS 次，停止重试")
+                    return null
+                }
+
+                view.post {
+                    if (settled.get()) return@post
+                    // 两条路同时走，谁先拿到带 aweme_detail 的响应就用谁
+                    val target = canonicalize(url)
+                    val cookie = readCookie(target)
+                    note("Cookie: ${cookieDigest(cookie)}")
+                    forward(target, cookie, "转发")
+                    if (!settled.get()) {
+                        note("页面内 fetch: ${hostOf(target)}")
+                        view.evaluateJavascript(jsFetchDetail(target), null)
                     }
                 }
                 // 返回 null = 不拦截，页面自己那次请求照常进行，页面不会因为我们而变空
@@ -350,15 +368,88 @@ class WebDetailFetcher(
     private fun matchesDetailApi(url: String): Boolean =
         DetailApiMatcher.matches(url, apiPaths)
 
+    private fun hostOf(url: String): String =
+        runCatching { java.net.URI(url).host }.getOrNull() ?: url.take(40)
+
     /**
-     * 在页面上下文里重新请求同一个详情 URL。
+     * 把 `*.douyin.com` 的 API 请求换回 `www.douyin.com`。
      *
-     * 这是整条链路的关键：页面内 fetch 由 WebView 网络栈发出，cookie / Referer /
-     * 同源身份全部天然正确，服务端就把它当成页面自己的请求。
+     * 抖音会把一部分请求分到 `www-hj.douyin.com` 这类第二域名上，但 `ttwid`
+     * 是 host-only 种在 `www.douyin.com` 的，跨过去就丢——而抖音对缺 ttwid 的
+     * 请求只回 `200 + 0 字节`，看起来像「接口挂了」。
+     * 签名参数在 query 里，与域名无关，改域名不影响校验。
+     */
+    private fun canonicalize(url: String): String {
+        val host = hostOf(url)
+        if (host == CANONICAL_HOST || !host.endsWith(".douyin.com")) return url
+        return url.replaceFirst("//$host", "//$CANONICAL_HOST")
+    }
+
+    /**
+     * 取 cookie。**必须先读 canonical 域名那份**：ttwid 在那儿。
+     * 同名 cookie 以先读到的为准，后来的不覆盖。
      *
-     * 而用 OkHttp 自己发时，`CookieManager.getCookie()` 在后台线程经常返回空，
-     * 服务端于是回 `200 + 空体`（对照实验见 tools/probe-ua.js：唯一触发空体的条件
-     * 就是没有 cookie，UA 与 sec-ch-ua 版本不一致都不影响）。
+     * 只能在主线程调：`CookieManager.getCookie()` 在 shouldInterceptRequest
+     * 的后台线程里经常返回空串。
+     */
+    private fun readCookie(targetUrl: String): String {
+        val cm = CookieManager.getInstance()
+        val merged = LinkedHashMap<String, String>()
+        fun absorb(u: String) {
+            val raw = runCatching { cm.getCookie(u) }.getOrNull() ?: return
+            raw.split(';').forEach { seg ->
+                val kv = seg.trim()
+                if (kv.isEmpty() || !kv.contains('=')) return@forEach
+                val name = kv.substringBefore('=')
+                if (name.isNotEmpty() && !merged.containsKey(name)) merged[name] = kv
+            }
+        }
+        absorb("https://$CANONICAL_HOST/")
+        absorb(targetUrl)
+        return merged.values.joinToString("; ")
+    }
+
+    private fun cookieDigest(cookie: String): String {
+        val names = cookie.split(';').map { it.trim().substringBefore('=') }.filter { it.isNotEmpty() }
+        return "${cookie.length}B / ${names.size} 项 / ttwid=" + if (cookie.contains(TTWID_KEY)) "有" else "无"
+    }
+
+    /**
+     * 补一次 ttwid。
+     *
+     * `ttwid` 由边缘节点在任意一次 `www.douyin.com` 的 HTML 响应里下发。万一
+     * CookieManager 里根本没有（换域名、清了数据、首屏走了缓存），这里直接请求
+     * 一次拿到 Set-Cookie，顺手写回 CookieManager，让页面后续请求也带上。
+     */
+    private fun bootstrapTtwid(): String? = runCatching {
+        val req = Request.Builder()
+            .url("https://$CANONICAL_HOST/")
+            .get()
+            .header("User-Agent", userAgent)
+            .header("Accept", "text/html,application/xhtml+xml")
+            .build()
+        forwardClient.newCall(req).execute().use { resp ->
+            val ttwid = resp.headers("Set-Cookie").firstNotNullOfOrNull { sc ->
+                if (sc.startsWith(TTWID_KEY)) sc.substringBefore(';') else null
+            }
+            if (ttwid != null) {
+                runCatching {
+                    CookieManager.getInstance()
+                        .setCookie("https://$CANONICAL_HOST/", "$ttwid; Path=/; Domain=.douyin.com")
+                }
+            }
+            ttwid
+        }
+    }.getOrNull()
+
+    /**
+     * 在页面上下文里请求 canonical 域名下的详情 URL。
+     *
+     * 页面本身就在 `www.douyin.com`，改回 canonical 后是**同源**请求，
+     * cookie（含 ttwid）由 WebView 网络栈自动携带，服务端就把它当页面自己发的。
+     *
+     * 结果无论成败都通过 onProbe 记一笔：真机失败时，最需要知道的就是
+     * 「它拿到的是空体、403，还是 SPA 的 HTML 外壳」。
      */
     private fun jsFetchDetail(url: String): String = """
         (function () {
@@ -366,11 +457,17 @@ class WebDetailFetcher(
             fetch(${JSONObject.quote(url)}, {
               credentials: 'include',
               headers: { 'Accept': 'application/json, text/plain, */*' }
-            }).then(function (r) { return r.text(); })
-              .then(function (t) {
-                if (t && t.indexOf('aweme_detail') >= 0) window.$BRIDGE_NAME.onDetail(t);
-              })
-              .catch(function (e) {});
+            }).then(function (r) {
+              return r.text().then(function (t) { return [r.status, t || '']; });
+            }).then(function (a) {
+              try {
+                window.$BRIDGE_NAME.onProbe('页面内 fetch: HTTP ' + a[0] + ', ' + a[1].length + 'B' +
+                  (a[1].indexOf('aweme_detail') >= 0 ? ' 有数据' : ' 无数据'));
+              } catch (e) {}
+              if (a[1] && a[1].indexOf('aweme_detail') >= 0) window.$BRIDGE_NAME.onDetail(a[1]);
+            }).catch(function (e) {
+              try { window.$BRIDGE_NAME.onProbe('页面内 fetch 失败: ' + e); } catch (e2) {}
+            });
           } catch (e) {}
         })();
     """.trimIndent()
@@ -378,14 +475,20 @@ class WebDetailFetcher(
     /**
      * 读 `<video src>` 作为最后手段。包成与详情接口同构的 JSON，
      * 这样上层不用为它写第二套解析逻辑。
+     *
+     * 真机上出现过 `v=1`（有一个 video 元素）却读不到地址的情况：`<video>` 的
+     * 真实地址常挂在 `currentSrc` 或内部 `<source>` 上，只读 `src` 会漏。
      */
     private fun readVideoTag(view: WebView, deliver: (String) -> Unit) {
         view.evaluateJavascript(
             "(() => { const v = document.querySelector('video');" +
-                " return v ? (v.currentSrc || v.src || '') : ''; })()"
+                " if (!v) return '';" +
+                " const s = v.currentSrc || v.src ||" +
+                "   (v.querySelector('source') ? v.querySelector('source').src : '') || '';" +
+                " return s; })()"
         ) { raw ->
             val url = raw?.trim()?.trim('"').orEmpty()
-            note("video 标签: " + if (url.isBlank()) "无" else url.take(100))
+            note("video 标签: " + if (url.isBlank()) "无" else url.take(90))
             if (!url.startsWith("http")) return@evaluateJavascript
             val json = JSONObject()
                 .put(
@@ -410,7 +513,16 @@ class WebDetailFetcher(
         private const val FORWARD_TIMEOUT_SEC = 12L
         private const val TAG_FALLBACK_DELAY_MS = 8_000L
         private const val DESTROY_DELAY_MS = 500L
-        private const val TRACE_MAX = 2_000
+        private const val TRACE_MAX = 4_000
+
+        /** 详情请求最多重试几次。页面失败后会连续重试，不设上限会打成请求风暴 */
+        private const val MAX_ATTEMPTS = 3
+
+        /** ttwid 是唯一必需项，缺它服务端回 200 空体 */
+        private const val TTWID_KEY = "ttwid="
+
+        /** API 请求的规范域名。ttwid 就绑在它上面，别改成 www-hj */
+        private const val CANONICAL_HOST = "www.douyin.com"
 
         /** 屏幕外窗口的额外偏移，保证整块窗口完全落在可视区之外 */
         private const val OFFSCREEN_GAP = 300
@@ -446,8 +558,8 @@ class WebDetailFetcher(
                   v: document.querySelectorAll('video').length,
                   aw: performance.getEntriesByType('resource')
                         .filter(function (e) { return e.name.indexOf('/aweme/') >= 0; })
-                        .map(function (e) { return e.name.split('?')[0].slice(-70); })
-                        .slice(0, 8)
+                        .map(function (e) { return e.name.split('?')[0].slice(-40); })
+                        .slice(0, 5)
                 });
               } catch (e) { return 'ERR ' + e; }
             })()

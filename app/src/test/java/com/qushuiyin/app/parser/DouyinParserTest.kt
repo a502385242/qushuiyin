@@ -80,4 +80,34 @@ class DouyinParserTest {
         val r = parser.parseDetailJson("<html>blocked</html>", "x")
         assertTrue(r is DouyinParser.ParseResult.Fail)
     }
+
+    /**
+     * 0.4.0 起不再取桌面详情接口，而是 WebView 抠出 video_id 后去 play 接口拿地址，
+     * 再拼一份同构 JSON 交给解析器。这条测试锁住那份合成 JSON 的字段形状——
+     * 一旦有人改了合成逻辑而解析器的候选路径没跟上，这里会先红。
+     */
+    @Test
+    fun `play 接口合成的详情能解出无水印地址`() {
+        val play = "https://aweme.snssdk.com/aweme/v1/play/?video_id=v0200fg10000dbc910vog65sp6ld28d0&ratio=1080p&line=0"
+        val json = """
+            {"aweme_detail":{"aweme_id":"7699062672146337075","desc":"好日子也是让我过上了 #疯狂水世界",
+             "video":{"cover":{"url_list":["https://p3.douyinpic.com/cover.jpeg"]},
+              "play_addr":{"url_list":["$play"],"data_size":10120457},
+              "bit_rate":[{"bit_rate":10120457,"gear_name":"9.7MB",
+                           "play_addr":{"url_list":["$play"]}}]}}}
+        """.trimIndent()
+
+        val r = parser.parseDetailJson(json, "7699062672146337075")
+        assertTrue("合成 JSON 必须能被解析，实际 $r", r is DouyinParser.ParseResult.Ok)
+        val a = (r as DouyinParser.ParseResult.Ok).aweme
+
+        assertEquals("7699062672146337075", a.id)
+        assertEquals("好日子也是让我过上了 #疯狂水世界", a.desc)
+        assertEquals("https://p3.douyinpic.com/cover.jpeg", a.coverUrl)
+        assertFalse(a.isImagePost)
+        // bit_rate 与 play_addr 是同一条地址，去重后只该剩一个
+        assertEquals("同一地址不该重复出现", 1, a.videoUrls.size)
+        assertEquals(play, a.bestVideoUrl)
+        assertFalse("play 地址一旦被改写成 playwm 就会带水印", a.bestVideoUrl!!.contains("playwm"))
+    }
 }

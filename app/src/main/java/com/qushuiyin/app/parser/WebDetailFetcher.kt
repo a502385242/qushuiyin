@@ -11,8 +11,6 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.Window
 import android.view.WindowManager
-import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -32,60 +30,57 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.Collections
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
 /**
- * 用一个离屏 WebView 让抖音自己的页面去取数据，我们只负责把结果捞出来。
+ * 取一条**无水印**的播放地址。
  *
- * 为什么必须要 WebView：`aweme/detail` 接口要求 `a_bogus`、`uifid`、
- * `x-secsdk-web-signature` 三个动态参数，其中 `a_bogus` 是混淆 JS 算出来的，
- * 纯客户端复刻等于长期做逆向。让页面自己算，我们只读它算完之后请求回来的那份 JSON。
+ * ## 为什么换掉了原来的方案（0.4.0）
  *
- * 为什么必须是**桌面 UA**：移动 UA 下页面会跳去 `m.douyin.com/share/...`，
- * 那里只有一个 `playwm` + `logo_name` 的地址，也就是**带水印的 720p**。
- * 桌面版才会请求 `aweme/detail`，那里才有 12 档清晰度。
+ * 0.2~0.3 一直在啃 `aweme/v1/web/aweme/detail` 这个桌面接口。它要求 `a_bogus` 签名，
+ * 而签名之外抖音还会校验「客户端身份是否自洽」：UA 说自己是 Windows Chrome/120，
+ * 客户端提示（`navigator.userAgentData` / `sec-ch-ua`）却如实报告 Android 143。
+ * 只要有这个矛盾，接口就不报错、**只回 200 + 0 字节**，或者干脆把整页 HTML 吐回来
+ * （实测 830 KB）。在 Android WebView 里这个矛盾无法消除——UA 能改，客户端提示改不了。
+ * 所以那条路在真机上永远走不通，问题不在实现，在方向。
  *
- * 取数用**网络层转发**，不用 JS 钩子。这是 0.3.0 的修正：
- * 旧实现把拦截脚本放在 `onPageStarted` 里 `evaluateJavascript`，而那一刻新文档
- * 还没创建，脚本执行在**旧文档**的上下文里，页面一换就没了——钩子从来没生效过。
+ * ## 现在的方案
  *
- * 0.3.1 起每条链路都往 [trace] 里记一笔。真机上到底卡在哪一步（页面没打开 / 页面
- * 没发请求 / 请求发了但转发失败 / 响应里没有作品对象），只有这一份记录能说清；
- * 用户手机上没有 adb，UI 上的「诊断信息」就是唯一的取证手段。
+ * 只用两个不设防的入口：
+ *
+ * ```
+ * ① 移动分享页（WebView 渲染）→ 从页面里读出 video_id
+ * ② GET aweme.snssdk.com/aweme/v1/play/?video_id=... → 302 → CDN 上的无水印 mp4
+ * ```
+ *
+ * 第 ② 步不需要签名、不需要 cookie、不需要登录，实测 1080×1920、1050 万字节，
+ * 抽帧肉眼确认无水印（`tools/probe-mobile.js` + ffmpeg 抽帧）。`ratio` 参数被服务端
+ * 忽略——给的一律是它能提供的最高档，所以只请求一次。
+ *
+ * 第 ① 步为什么必须靠 WebView：`video_id`（形如 `v0200fg10000...`）不在任何
+ * 纯 HTTP 响应里，页面 JS 现场才算出来。好在移动页**不需要签名**，只要 UA 与客户端
+ * 提示自洽（不覆写 UA 即自洽）就能正常渲染。
+ *
+ * ## 产物
+ *
+ * 拼一份与旧详情接口同构的 JSON 交给 [DouyinParser]，这样上层解析、UI、后续下载
+ * 都不用改。字段只放我们真正验证过的：desc / cover / play_addr / images。
  */
 class WebDetailFetcher(
     context: Context,
     private val urlTemplate: String = DEFAULT_URL_TEMPLATE,
-    private val userAgent: String = DEFAULT_DESKTOP_UA,
-    /** 详情接口的 URL 片段，命中即转发。来自解析规则，改版时能靠热更新救回来 */
-    private val apiPaths: List<String> = DEFAULT_API_PATHS,
     private val http: OkHttpClient = Http.client
 ) : DetailSource {
 
     private val appContext = context.applicationContext
 
-    /** 转发用的客户端：加一层整体超时，避免页面等我们等到用户以为卡死 */
-    private val forwardClient: OkHttpClient by lazy {
-        http.newBuilder()
-            .callTimeout(FORWARD_TIMEOUT_SEC, TimeUnit.SECONDS)
-            .build()
-    }
+    /** 探测 play 地址走 IO，WebView 操作走主线程 */
+    private val work = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val sb = StringBuilder()
 
-    /** 转发/补 cookie 都在 IO 线程做，主线程只负责读 cookie 和改 WebView */
-    private val work = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    /** 已经处理过的详情 URL。页面内 fetch 自己也会再走一遍 shouldInterceptRequest，不去重会打转 */
-    private val fired: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
-
-    /** 页面重试时会连续发好几次详情请求，超过次数就停手，别把请求打成风暴 */
-    private val attempts = java.util.concurrent.atomic.AtomicInteger(0)
-
-    /** 给 UI 看的取证记录。多线程写入（网络线程 / 主线程 / JS 回调），必须加锁 */
+    /** 给 UI 看的取证记录。多线程写入，必须加锁 */
     val trace: String get() = synchronized(sb) { sb.toString() }
 
     private fun note(msg: String) = synchronized(sb) {
@@ -97,12 +92,11 @@ class WebDetailFetcher(
         return withTimeoutOrNull(TIMEOUT_MS) {
             withContext(Dispatchers.Main) { load(awemeId) }
         } ?: run {
-            note("done: 超时 ${TIMEOUT_MS / 1000}s，没等到详情")
+            note("done: 超时 ${TIMEOUT_MS / 1000}s，页面没给出 video_id")
             null
         }
     }
 
-    /** 系统 WebView 内核版本。抖音页面在太旧的内核上会直接降级，这是最常见的真机差异 */
     private fun systemWebViewVersion(): String = runCatching {
         val p = WebView.getCurrentWebViewPackage()
         if (p == null) "无法获取" else "${p.packageName} ${p.versionName}"
@@ -112,14 +106,15 @@ class WebDetailFetcher(
     private suspend fun load(awemeId: String): String? = suspendCancellableCoroutine { cont ->
         val webView = WebView(appContext)
         val settled = AtomicBoolean(false)
+        val resolving = AtomicBoolean(false)
         val host = attachToWindow(webView)
+        val handler = Handler(Looper.getMainLooper())
 
         fun settle(result: String?, by: String) {
             if (!settled.compareAndSet(false, true)) return
             note("done: $by -> " + if (result == null) "空" else "${result.length} 字节")
-            // 不能立刻销毁：此刻 WebView 可能正拿着我们刚返回的响应流在读，
-            // 直接销毁会让它读到一个已关闭的流。给半秒缓冲。
-            Handler(Looper.getMainLooper()).postDelayed({
+            // 不能立刻 destroy：此刻 WebView 可能正拿着我们刚返回的响应流在读
+            handler.postDelayed({
                 runCatching {
                     webView.stopLoading()
                     webView.loadUrl("about:blank")
@@ -130,157 +125,111 @@ class WebDetailFetcher(
             if (cont.isActive) cont.resume(result)
         }
 
-        fun inject(view: WebView?) {
-            if (settled.get()) return
-            view?.evaluateJavascript(HOOK_JS, null)
+        /**
+         * 拿到 video_id，去 play 接口验一次再返回。
+         *
+         * 验一次的价值：video_id 可能是从页面里抠错了、或者片子已删，只有真发一个
+         * Range 请求才知道服务端认不认。验不过就退回复位，让后面的采样继续试。
+         */
+        fun resolve(vid: String, page: PageInfo, by: String) {
+            if (settled.get() || !resolving.compareAndSet(false, true)) return
+            note("video_id($by): ${vid.take(24)}")
+            work.launch {
+                val probe = probePlay(vid)
+                if (probe == null) {
+                    note("play 接口没通过，继续等页面")
+                    resolving.set(false)
+                    return@launch
+                }
+                val json = buildDetailJson(awemeId, probe, page).toString()
+                settle(json, "play 接口实测通过（${probe.label}）")
+            }
         }
 
-        /**
-         * 自己转发一次。
-         *
-         * 0.3.3 的关键修正：转发**必须打 canonical 域名（www.douyin.com）**。
-         * 真机日志里详情接口走的是 `www-hj.douyin.com`，而抖音把 `ttwid` 这个
-         * host-only cookie 种在 `www.douyin.com` 上——跨到 `www-hj` 就带不过去，
-         * 服务端于是回 `200 + 0 字节`。对照实验见 tools/probe-cookie.js：
-         * 35 项 cookie 留一法测试，只有去掉 ttwid 会挂，其余都不影响。
-         */
-        fun forward(target: String, cookie: String, by: String) {
-            work.launch {
-                var ck = cookie
-                if (!ck.contains(TTWID_KEY)) {
-                    note("Cookie 缺 ttwid，补一次")
-                    val t = bootstrapTtwid()
-                    if (t != null) {
-                        ck = if (ck.isBlank()) t else "$ck; $t"
-                        note("已补 ttwid ${t.length}B")
-                    } else {
-                        note("补 ttwid 失败")
+        fun resolveImages(page: PageInfo) {
+            if (settled.get() || !resolving.compareAndSet(false, true)) return
+            if (page.images.isEmpty()) {
+                resolving.set(false)
+                return
+            }
+            note("按图文作品处理，${page.images.size} 张图")
+            val detail = JSONObject()
+                .put("aweme_id", awemeId)
+                .put("desc", cleanTitle(page.title))
+                .put(
+                    "images",
+                    JSONArray(page.images.map { JSONObject().put("url_list", JSONArray().put(it)) })
+                )
+            if (page.cover.isNotBlank()) {
+                detail.put("video", JSONObject().put("cover", JSONObject().put("url_list", JSONArray().put(page.cover))))
+            }
+            settle(JSONObject().put("aweme_detail", detail).toString(), "图文作品")
+        }
+
+        // ---------- 采样：页面每渲染一步就试一次 ----------
+
+        val poller = object : Runnable {
+            private var n = 0
+
+            override fun run() {
+                if (settled.get() || n >= MAX_POLLS) return
+                n++
+                webView.evaluateJavascript(PROBE_JS) { raw ->
+                    val page = PageInfo.parse(raw)
+                    if (page == null) {
+                        note("采样 $n: 读不到页面")
+                        return@evaluateJavascript
+                    }
+                    when {
+                        page.videoId.isNotBlank() -> resolve(page.videoId, page, "采样 $n")
+                        page.videoCount == 0 && page.images.isNotEmpty() -> resolveImages(page)
+                        else -> note("采样 $n: 无 video_id（title=${page.title.take(16)}, video=${page.videoCount}）")
                     }
                 }
-                val req = Request.Builder()
-                    .url(target)
-                    .get()
-                    .header("User-Agent", userAgent)
-                    .header("Accept", "application/json, text/plain, */*")
-                    .header("Accept-Language", "zh-CN,zh;q=0.9")
-                    .header("Referer", "https://$CANONICAL_HOST/")
-                    .apply { if (ck.isNotBlank()) header("Cookie", ck) }
-                    .build()
-                runCatching {
-                    forwardClient.newCall(req).execute().use { resp ->
-                        val body = resp.body?.string()
-                        note("$by -> ${hostOf(target)} HTTP ${resp.code}, ${body?.length ?: 0} 字节")
-                        if (!body.isNullOrBlank() && body.contains(DETAIL_KEY)) {
-                            settle(body, by)
-                        } else if (!body.isNullOrBlank()) {
-                            // 有响应但没作品对象：把开头记下来，能区分「需要登录」「作品不存在」「被风控」
-                            note("$by 返回内容: " + body.take(120).replace('\n', ' '))
-                        }
-                    }
-                }.onFailure { note("$by 异常: ${it.javaClass.simpleName} ${it.message?.take(60)}") }
+                handler.postDelayed(this, POLL_INTERVAL_MS)
             }
         }
 
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            // 图片照常加载：我们要的是「看起来就是个普通浏览器」。
-            // 关掉图片确实能省几百 KB，但省这点流量的收益远小于被判定成异常客户端的风险。
+            // 图片照常加载：页面要靠自己的 JS 把播放器挂起来，video_id 才会出现
             blockNetworkImage = false
             loadsImagesAutomatically = true
             cacheMode = WebSettings.LOAD_DEFAULT
-            userAgentString = userAgent
-            mediaPlaybackRequiresUserGesture = true
+            // **刻意不覆写 UA**。覆写成桌面 UA 会让 UA 与客户端提示互相矛盾，
+            // 抖音那边直接就回空体了（这是 0.2~0.3 一直失败的真因）。
+            mediaPlaybackRequiresUserGesture = false
         }
-
-        webView.addJavascriptInterface(
-            object {
-                @JavascriptInterface
-                fun onDetail(json: String) {
-                    if (json.isNotBlank()) settle(json, "JS 钩子")
-                }
-
-                /** 页面内 fetch 的中间结果只有这里能看见，失败时必须能看出它拿到的是空体还是 HTML */
-                @JavascriptInterface
-                fun onProbe(msg: String) {
-                    note(msg.take(120))
-                }
-            },
-            BRIDGE_NAME
-        )
 
         webView.webViewClient = object : WebViewClient() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                note("开始加载: ${url?.take(120)}")
+                note("开始加载: ${url?.take(100)}")
             }
 
             /**
-             * 命中详情接口时**不接管**这次请求，只借它的 URL 自己去请求一次。
-             *
-             * 为什么不接管：页面自己那次请求是算好签名的，接管后我们得替它发，
-             * 一旦失败页面就彻底白屏，连兜底的 `<video>` 都读不到。
-             *
-             * 0.3.3 的核心修正——**域名要换回 canonical 的 www.douyin.com**：
-             * 真机日志显示详情接口走 `www-hj.douyin.com`，而 `ttwid` 是 host-only
-             * 种在 `www.douyin.com` 上的，跨到 `www-hj` 就带不过去。抖音对没有
-             * ttwid 的请求不报错，只回 `200 + 0 字节`（实测 35 项 cookie 留一法，
-             * 只有 ttwid 是必需的，见 tools/probe-cookie.js）。
-             * 签名（a_bogus）只跟路径和 query 有关，与域名无关——同一份 query
-             * 打 www 和打 www-hj 都能通，前提是 cookie 带全。
+             * 抢跑：播放器一定会去请求 `.../playwm/?...&video_id=xxx`，
+             * 这条请求比 DOM 里出现 `<video src>` 更早，从这里直接薅出 video_id 最快。
+             * 注意只取 id，**不用它返回的地址**——`playwm` 是带水印的那条。
              */
             override fun shouldInterceptRequest(
                 view: WebView?,
                 request: WebResourceRequest?
             ): WebResourceResponse? {
-                if (request == null || request.method != "GET") return null
-                val url = request.url?.toString() ?: return null
-                if (!matchesDetailApi(url)) return null
-
-                note("命中详情接口: ${hostOf(url)}")
-                if (view == null || !fired.add(url)) return null
-                if (attempts.incrementAndGet() > MAX_ATTEMPTS) {
-                    note("详情请求已发 $MAX_ATTEMPTS 次，停止重试")
-                    return null
-                }
-
-                view.post {
-                    if (settled.get()) return@post
-                    // 两条路同时走，谁先拿到带 aweme_detail 的响应就用谁
-                    val target = canonicalize(url)
-                    val cookie = readCookie(target)
-                    note("Cookie: ${cookieDigest(cookie)}")
-                    forward(target, cookie, "转发")
-                    if (!settled.get()) {
-                        note("页面内 fetch: ${hostOf(target)}")
-                        view.evaluateJavascript(jsFetchDetail(target), null)
-                    }
-                }
-                // 返回 null = 不拦截，页面自己那次请求照常进行，页面不会因为我们而变空
+                val url = request?.url?.toString() ?: return null
+                if (!url.contains("video_id=")) return null
+                if (!url.contains("/play") && !url.contains("/aweme/v1/play")) return null
+                val vid = VIDEO_ID_REGEX.find(url)?.groupValues?.getOrNull(1) ?: return null
+                view?.post { resolve(vid, PageInfo.empty(), "播放器请求") }
                 return null
             }
 
-            override fun onPageCommitVisible(view: WebView?, url: String?) = inject(view)
-
             override fun onPageFinished(view: WebView?, url: String?) {
-                note("加载完成: ${url?.take(120)}")
-                inject(view)
-                if (view != null) {
-                    // 记录页面真实状态：标题为空 / 是验证页 / HTML 极小 / 可见性 hidden，
-                    // 这几种病因的处理方式完全不同，不能靠猜
-                    view.evaluateJavascript(PAGE_STATE_JS) { raw ->
-                        note("页面状态: ${raw?.take(300)}")
-                    }
-                    // 兜底：详情接口没被截到（页面改走别的通道、或我们转发失败）时，
-                    // 退一步读页面里 <video> 的地址。只有一档清晰度，但总比失败强。
-                    view.postDelayed({
-                        // 顺便再采一次状态，这时才看得到页面实际发出了哪些接口
-                        view.evaluateJavascript(PAGE_STATE_JS) { raw ->
-                            note("8s 后状态: ${raw?.take(400)}")
-                        }
-                        readVideoTag(view) { settle(it, "video 标签") }
-                    }, TAG_FALLBACK_DELAY_MS)
-                }
+                note("加载完成: ${url?.take(100)}")
+                if (settled.get()) return
+                handler.removeCallbacks(poller)
+                handler.post(poller)
             }
 
             override fun onReceivedHttpError(
@@ -289,7 +238,7 @@ class WebDetailFetcher(
                 errorResponse: WebResourceResponse?
             ) {
                 if (request?.isForMainFrame == true) {
-                    note("主页 HTTP ${errorResponse?.statusCode}: ${request.url?.toString()?.take(100)}")
+                    note("主页 HTTP ${errorResponse?.statusCode}: ${request.url?.toString()?.take(80)}")
                 }
             }
 
@@ -306,7 +255,8 @@ class WebDetailFetcher(
         }
 
         cont.invokeOnCancellation {
-            Handler(Looper.getMainLooper()).post {
+            handler.removeCallbacks(poller)
+            handler.post {
                 runCatching {
                     host?.dismiss()
                     webView.destroy()
@@ -319,16 +269,128 @@ class WebDetailFetcher(
         webView.loadUrl(target)
     }
 
+    // ---------- play 接口 ----------
+
+    private class Probe(val url: String, val size: Long, val label: String)
+
+    /**
+     * 用 `Range: bytes=0-1` 只取 2 字节，拿到 206 + `Content-Range` 里的总长度。
+     * 总长度同时当作「档位」展示——它比分辨率好判断，也确实是画质的直接体现。
+     */
+    private fun probePlay(vid: String): Probe? {
+        for (host in PLAY_HOSTS) {
+            val url = "https://$host/aweme/v1/play/?video_id=$vid&ratio=1080p&line=0"
+            val req = Request.Builder()
+                .url(url)
+                .get()
+                .header("User-Agent", HTTP_UA)
+                .header("Range", "bytes=0-1")
+                .build()
+            runCatching {
+                http.newCall(req).execute().use { resp ->
+                    val size = contentRangeTotal(resp.header("Content-Range"))
+                        ?: resp.body?.contentLength()?.takeIf { it > 0 }
+                        ?: 0L
+                    val ct = resp.header("Content-Type").orEmpty()
+                    val ok = resp.isSuccessful && (size > 0 || ct.startsWith("video/"))
+                    note("play $host: HTTP ${resp.code} ${humanSize(size)} $ct")
+                    if (ok) return Probe(url, size, humanSize(size))
+                }
+            }.onFailure { note("play $host 异常: ${it.javaClass.simpleName}") }
+        }
+        return null
+    }
+
+    private fun contentRangeTotal(header: String?): Long? {
+        val v = header ?: return null
+        val i = v.lastIndexOf('/')
+        if (i < 0) return null
+        return v.substring(i + 1).trim().toLongOrNull()
+    }
+
+    private fun humanSize(bytes: Long): String = when {
+        bytes <= 0 -> "未知"
+        bytes < 1024 -> "${bytes}B"
+        bytes < 1024 * 1024 -> "${bytes / 1024}KB"
+        else -> String.format("%.1fMB", bytes / 1024.0 / 1024.0)
+    }
+
+    /**
+     * 拼一份与旧 `aweme/detail` 同构的 JSON。
+     *
+     * `bit_rate` 里塞的是文件字节数：上层按它从高到低排序选清晰度，字节数作为
+     * 画质代理足够可靠（同一段视频，1080p 一定比 720p 大）。
+     */
+    private fun buildDetailJson(awemeId: String, probe: Probe, page: PageInfo): JSONObject {
+        val playAddr = JSONObject()
+            .put("url_list", JSONArray().put(probe.url))
+            .put("data_size", probe.size)
+        val video = JSONObject()
+            .put("play_addr", playAddr)
+            .put(
+                "bit_rate",
+                JSONArray().put(
+                    JSONObject()
+                        .put("bit_rate", probe.size)
+                        .put("gear_name", probe.label)
+                        .put("play_addr", JSONObject().put("url_list", JSONArray().put(probe.url)))
+                )
+            )
+        if (page.cover.isNotBlank()) {
+            video.put("cover", JSONObject().put("url_list", JSONArray().put(page.cover)))
+        }
+        if (page.images.isNotEmpty()) {
+            video.put("images", JSONArray(page.images.map { JSONObject().put("url_list", JSONArray().put(it)) }))
+        }
+        val detail = JSONObject()
+            .put("aweme_id", awemeId)
+            .put("desc", cleanTitle(page.title))
+            .put("video", video)
+        return JSONObject().put("aweme_detail", detail)
+    }
+
+    private fun cleanTitle(raw: String): String =
+        raw.removeSuffix(" - 抖音").removeSuffix("-抖音").trim()
+
+    /** 页面采样结果 */
+    private data class PageInfo(
+        val title: String,
+        val cover: String,
+        val videoId: String,
+        val videoCount: Int,
+        val images: List<String>
+    ) {
+        companion object {
+            fun empty() = PageInfo("", "", "", -1, emptyList())
+
+            /** evaluateJavascript 返回的是 JS 值的 JSON 表示，这里直接按对象解析 */
+            fun parse(raw: String?): PageInfo? {
+                if (raw.isNullOrBlank() || raw == "null") return null
+                val o = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+                val imgs = ArrayList<String>()
+                o.optJSONArray("imgs")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val s = arr.optString(i)
+                        if (s.isNotBlank()) imgs.add(s)
+                    }
+                }
+                return PageInfo(
+                    title = o.optString("title"),
+                    cover = o.optString("cover"),
+                    videoId = o.optString("vid"),
+                    videoCount = o.optInt("v", -1),
+                    images = imgs
+                )
+            }
+        }
+    }
+
     /**
      * 把 WebView 挂到一个真实窗口上，然后整块挪到屏幕外。
      *
-     * 为什么不能只用裸 WebView：没有 attach 到窗口的 WebView 不参与渲染循环，
-     * `requestAnimationFrame` 不回调、`document.visibilityState` 可能是 hidden。
-     * 抖音的页面在这种环境下很可能不发起详情请求，而桌面浏览器里一切正常——
-     * 这正是「同样的代码在电脑上跑得通、在手机上永远失败」最典型的成因。
-     *
-     * 为什么用屏幕外而不是 1×1：1×1 的窗口会让页面视口只有 1×1，
-     * 依赖 IntersectionObserver 的懒加载逻辑会全部失灵。给一个正常视口再挪走最稳。
+     * 没有 attach 到窗口的 WebView 不参与渲染循环，`requestAnimationFrame` 不回调，
+     * 页面可能因此不初始化播放器；而视频地址正是播放器起来之后才有的。
+     * 用屏幕外而不是 1×1：1×1 的视口会让懒加载逻辑全部失灵。
      */
     private fun attachToWindow(webView: WebView): Dialog? {
         val activity = App.currentActivity ?: run {
@@ -363,251 +425,69 @@ class WebDetailFetcher(
         }
     }
 
-    // ---------- 转发 ----------
-
-    private fun matchesDetailApi(url: String): Boolean =
-        DetailApiMatcher.matches(url, apiPaths)
-
-    private fun hostOf(url: String): String =
-        runCatching { java.net.URI(url).host }.getOrNull() ?: url.take(40)
-
-    /**
-     * 把 `*.douyin.com` 的 API 请求换回 `www.douyin.com`。
-     *
-     * 抖音会把一部分请求分到 `www-hj.douyin.com` 这类第二域名上，但 `ttwid`
-     * 是 host-only 种在 `www.douyin.com` 的，跨过去就丢——而抖音对缺 ttwid 的
-     * 请求只回 `200 + 0 字节`，看起来像「接口挂了」。
-     * 签名参数在 query 里，与域名无关，改域名不影响校验。
-     */
-    private fun canonicalize(url: String): String {
-        val host = hostOf(url)
-        if (host == CANONICAL_HOST || !host.endsWith(".douyin.com")) return url
-        return url.replaceFirst("//$host", "//$CANONICAL_HOST")
-    }
-
-    /**
-     * 取 cookie。**必须先读 canonical 域名那份**：ttwid 在那儿。
-     * 同名 cookie 以先读到的为准，后来的不覆盖。
-     *
-     * 只能在主线程调：`CookieManager.getCookie()` 在 shouldInterceptRequest
-     * 的后台线程里经常返回空串。
-     */
-    private fun readCookie(targetUrl: String): String {
-        val cm = CookieManager.getInstance()
-        val merged = LinkedHashMap<String, String>()
-        fun absorb(u: String) {
-            val raw = runCatching { cm.getCookie(u) }.getOrNull() ?: return
-            raw.split(';').forEach { seg ->
-                val kv = seg.trim()
-                if (kv.isEmpty() || !kv.contains('=')) return@forEach
-                val name = kv.substringBefore('=')
-                if (name.isNotEmpty() && !merged.containsKey(name)) merged[name] = kv
-            }
-        }
-        absorb("https://$CANONICAL_HOST/")
-        absorb(targetUrl)
-        return merged.values.joinToString("; ")
-    }
-
-    private fun cookieDigest(cookie: String): String {
-        val names = cookie.split(';').map { it.trim().substringBefore('=') }.filter { it.isNotEmpty() }
-        return "${cookie.length}B / ${names.size} 项 / ttwid=" + if (cookie.contains(TTWID_KEY)) "有" else "无"
-    }
-
-    /**
-     * 补一次 ttwid。
-     *
-     * `ttwid` 由边缘节点在任意一次 `www.douyin.com` 的 HTML 响应里下发。万一
-     * CookieManager 里根本没有（换域名、清了数据、首屏走了缓存），这里直接请求
-     * 一次拿到 Set-Cookie，顺手写回 CookieManager，让页面后续请求也带上。
-     */
-    private fun bootstrapTtwid(): String? = runCatching {
-        val req = Request.Builder()
-            .url("https://$CANONICAL_HOST/")
-            .get()
-            .header("User-Agent", userAgent)
-            .header("Accept", "text/html,application/xhtml+xml")
-            .build()
-        forwardClient.newCall(req).execute().use { resp ->
-            val ttwid = resp.headers("Set-Cookie").firstNotNullOfOrNull { sc ->
-                if (sc.startsWith(TTWID_KEY)) sc.substringBefore(';') else null
-            }
-            if (ttwid != null) {
-                runCatching {
-                    CookieManager.getInstance()
-                        .setCookie("https://$CANONICAL_HOST/", "$ttwid; Path=/; Domain=.douyin.com")
-                }
-            }
-            ttwid
-        }
-    }.getOrNull()
-
-    /**
-     * 在页面上下文里请求 canonical 域名下的详情 URL。
-     *
-     * 页面本身就在 `www.douyin.com`，改回 canonical 后是**同源**请求，
-     * cookie（含 ttwid）由 WebView 网络栈自动携带，服务端就把它当页面自己发的。
-     *
-     * 结果无论成败都通过 onProbe 记一笔：真机失败时，最需要知道的就是
-     * 「它拿到的是空体、403，还是 SPA 的 HTML 外壳」。
-     */
-    private fun jsFetchDetail(url: String): String = """
-        (function () {
-          try {
-            fetch(${JSONObject.quote(url)}, {
-              credentials: 'include',
-              headers: { 'Accept': 'application/json, text/plain, */*' }
-            }).then(function (r) {
-              return r.text().then(function (t) { return [r.status, t || '']; });
-            }).then(function (a) {
-              try {
-                window.$BRIDGE_NAME.onProbe('页面内 fetch: HTTP ' + a[0] + ', ' + a[1].length + 'B' +
-                  (a[1].indexOf('aweme_detail') >= 0 ? ' 有数据' : ' 无数据'));
-              } catch (e) {}
-              if (a[1] && a[1].indexOf('aweme_detail') >= 0) window.$BRIDGE_NAME.onDetail(a[1]);
-            }).catch(function (e) {
-              try { window.$BRIDGE_NAME.onProbe('页面内 fetch 失败: ' + e); } catch (e2) {}
-            });
-          } catch (e) {}
-        })();
-    """.trimIndent()
-
-    /**
-     * 读 `<video src>` 作为最后手段。包成与详情接口同构的 JSON，
-     * 这样上层不用为它写第二套解析逻辑。
-     *
-     * 真机上出现过 `v=1`（有一个 video 元素）却读不到地址的情况：`<video>` 的
-     * 真实地址常挂在 `currentSrc` 或内部 `<source>` 上，只读 `src` 会漏。
-     */
-    private fun readVideoTag(view: WebView, deliver: (String) -> Unit) {
-        view.evaluateJavascript(
-            "(() => { const v = document.querySelector('video');" +
-                " if (!v) return '';" +
-                " const s = v.currentSrc || v.src ||" +
-                "   (v.querySelector('source') ? v.querySelector('source').src : '') || '';" +
-                " return s; })()"
-        ) { raw ->
-            val url = raw?.trim()?.trim('"').orEmpty()
-            note("video 标签: " + if (url.isBlank()) "无" else url.take(90))
-            if (!url.startsWith("http")) return@evaluateJavascript
-            val json = JSONObject()
-                .put(
-                    "aweme_detail",
-                    JSONObject().put(
-                        "video",
-                        JSONObject().put(
-                            "play_addr",
-                            JSONObject().put("url_list", JSONArray().put(url))
-                        )
-                    )
-                )
-                .toString()
-            deliver(json)
-        }
-    }
-
     companion object {
-        private const val BRIDGE_NAME = "QuShuiYin"
-        private const val DETAIL_KEY = "aweme_detail"
-        private const val TIMEOUT_MS = 30_000L
-        private const val FORWARD_TIMEOUT_SEC = 12L
-        private const val TAG_FALLBACK_DELAY_MS = 8_000L
+        private const val TIMEOUT_MS = 25_000L
+        private const val POLL_INTERVAL_MS = 1_200L
+        private const val MAX_POLLS = 12
         private const val DESTROY_DELAY_MS = 500L
         private const val TRACE_MAX = 4_000
-
-        /** 详情请求最多重试几次。页面失败后会连续重试，不设上限会打成请求风暴 */
-        private const val MAX_ATTEMPTS = 3
-
-        /** ttwid 是唯一必需项，缺它服务端回 200 空体 */
-        private const val TTWID_KEY = "ttwid="
-
-        /** API 请求的规范域名。ttwid 就绑在它上面，别改成 www-hj */
-        private const val CANONICAL_HOST = "www.douyin.com"
-
-        /** 屏幕外窗口的额外偏移，保证整块窗口完全落在可视区之外 */
         private const val OFFSCREEN_GAP = 300
 
+        /** 分享页。移动 UA 下会 302 到 m.douyin.com/share/video/{id}，这里直接打终点少一跳 */
         const val DEFAULT_URL_TEMPLATE = "https://www.douyin.com/video/{id}"
 
-        /**
-         * 详情接口的候选片段。第一个是当前线上路径；第二个是去掉版本前缀的宽松匹配，
-         * 用来扛「接口换版本号」这种小改版。
-         */
-        val DEFAULT_API_PATHS = listOf(
-            "/aweme/v1/web/aweme/detail/",
-            "/aweme/detail/"
-        )
+        /** play 接口的候选域名，一个不通换下一个 */
+        private val PLAY_HOSTS = listOf("aweme.snssdk.com", "api.amemv.com")
+
+        private const val HTTP_UA =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36"
+
+        private val VIDEO_ID_REGEX = Regex("""[?&]video_id=([A-Za-z0-9_-]{10,})""")
 
         /**
-         * 采集页面现场。
-         *
-         * `vis` 是重点：离屏 WebView 的 document.visibilityState 可能是 hidden，
-         * 而部分 SPA 会因此在初始化时跳过数据预取——真机失败、桌面浏览器成功，
-         * 差别往往就在这里。
-         *
-         * `aw` 列出页面实际发出的 /aweme/ 接口，用来区分「没发请求」和「发了但被拒」。
+         * 页面采样。三件事：
+         *  1. 从 DOM / HTML / `<video src>` 里抠 `video_id`
+         *  2. 拿标题和封面（og:image），UI 要显示
+         *  3. 图文作品没有 video_id，退回收集图片地址
          */
-        private val PAGE_STATE_JS = """
+        private val PROBE_JS = """
             (function () {
+              var out = { title: '', cover: '', vid: '', v: 0, imgs: [] };
               try {
-                return JSON.stringify({
-                  t: document.title || '',
-                  rs: document.readyState,
-                  vis: document.visibilityState,
-                  n: document.documentElement ? document.documentElement.outerHTML.length : 0,
-                  v: document.querySelectorAll('video').length,
-                  aw: performance.getEntriesByType('resource')
-                        .filter(function (e) { return e.name.indexOf('/aweme/') >= 0; })
-                        .map(function (e) { return e.name.split('?')[0].slice(-40); })
-                        .slice(0, 5)
-                });
-              } catch (e) { return 'ERR ' + e; }
+                out.title = document.title || '';
+                var m = document.querySelector('meta[property="og:image"]');
+                if (m) out.cover = m.getAttribute('content') || '';
+                var videos = document.querySelectorAll('video');
+                out.v = videos.length;
+                var v = videos[0];
+                var src = v ? (v.currentSrc || v.src || '') : '';
+                if (!out.vid && src) {
+                  var a = src.match(/[?&]video_id=([A-Za-z0-9_-]+)/);
+                  if (a) out.vid = a[1];
+                }
+                if (!out.vid) {
+                  var html = document.documentElement ? document.documentElement.outerHTML : '';
+                  var b = html.match(/[?&]video_id=([A-Za-z0-9_-]{10,})/);
+                  if (b) out.vid = b[1];
+                }
+                if (!out.vid) {
+                  var html2 = document.documentElement ? document.documentElement.outerHTML : '';
+                  var c = html2.match(/"video_id"\s*:\s*"([A-Za-z0-9_-]{10,})"/);
+                  if (c) out.vid = c[1];
+                }
+                if (out.v === 0) {
+                  var imgs = document.querySelectorAll('img');
+                  for (var i = 0; i < imgs.length && out.imgs.length < 9; i++) {
+                    var u = imgs[i].currentSrc || imgs[i].src || '';
+                    if (u.indexOf('douyinpic') > 0 && u.indexOf('avatar') < 0 && u.indexOf('100x100') < 0) {
+                      out.imgs.push(u);
+                    }
+                  }
+                }
+              } catch (e) {}
+              return out;
             })()
-        """.trimIndent()
-
-        /**
-         * 桌面 UA。刻意不跟随系统：移动 UA 拿到的是带水印的 720p。
-         * 这是「无损画质」能不能成立的前提，不要顺手改成 WebSettings.getDefaultUserAgent()。
-         */
-        const val DEFAULT_DESKTOP_UA =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-        /**
-         * 辅助钩子：网络层已经是主路径，这里只是第二保险——
-         * 万一某些版本的 WebView 不走 shouldInterceptRequest，页面自己发出的 XHR
-         * 也能被这里兜住。XHR 和 fetch 都挂，是因为页面用哪种取决于它内部封装。
-         */
-        private val HOOK_JS = """
-            (function () {
-              if (window.__qsyHooked) return;
-              window.__qsyHooked = true;
-              var isDetail = function (u) { return String(u || '').indexOf('/aweme/detail') >= 0; };
-              var post = function (t) {
-                try { if (t && t.indexOf('aweme_detail') >= 0) window.$BRIDGE_NAME.onDetail(t); } catch (e) {}
-              };
-              var open = XMLHttpRequest.prototype.open;
-              XMLHttpRequest.prototype.open = function (m, u) { this.__qsyUrl = u; return open.apply(this, arguments); };
-              var send = XMLHttpRequest.prototype.send;
-              XMLHttpRequest.prototype.send = function () {
-                var self = this;
-                self.addEventListener('load', function () {
-                  try { if (isDetail(self.__qsyUrl)) post(self.responseText); } catch (e) {}
-                });
-                return send.apply(this, arguments);
-              };
-              if (window.fetch) {
-                var f = window.fetch;
-                window.fetch = function () {
-                  return f.apply(this, arguments).then(function (r) {
-                    try {
-                      if (isDetail(r && r.url)) r.clone().text().then(post, function () {});
-                    } catch (e) {}
-                    return r;
-                  });
-                };
-              }
-            })();
         """.trimIndent()
     }
 }

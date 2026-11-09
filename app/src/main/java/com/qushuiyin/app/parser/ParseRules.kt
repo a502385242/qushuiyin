@@ -25,11 +25,17 @@ data class ParseRules(
     val sourceMode: String = SOURCE_WEBVIEW,
     /** WebView 要打开的页面，{id} 会被替换成作品 ID */
     val detailUrlTemplate: String = DEFAULT_DETAIL_URL,
-    /** WebView 的 UA。**必须是桌面 UA**，移动 UA 只能拿到带水印的 720p */
+    /**
+     * **0.4.0 起忽略**。
+     *
+     * 曾经靠「覆写成桌面 UA」去骗桌面版详情接口，结果 UA 与客户端提示（`sec-ch-ua`
+     * / `navigator.userAgentData`）自相矛盾，抖音直接回 200 空体。Android WebView
+     * 改不了客户端提示，这条路在真机上无解。字段保留只为兼容旧 manifest 的验签。
+     */
     val desktopUa: String = DEFAULT_DESKTOP_UA,
     /**
-     * 详情接口的 URL 片段。WebView 里命中这些片段的 GET 请求会被原样转发并读回响应体。
-     * 抖音换接口路径时，推一份新规则就能救回来，不用发版。
+     * **0.4.0 起忽略**。桌面详情接口已整条放弃（见 [WebDetailFetcher] 的类注释）。
+     * 保留字段同样只为兼容旧 manifest。
      */
     val detailApiPaths: List<String> = DEFAULT_API_PATHS,
     val shareHosts: List<String> = DEFAULT_HOSTS,
@@ -50,8 +56,11 @@ data class ParseRules(
         const val DEFAULT_DETAIL_URL = "https://www.douyin.com/video/{id}"
 
         /**
-         * 桌面 UA。移动 UA 下抖音会跳到 m.douyin.com，那里只提供
-         * `playwm` + `logo_name` 的地址，也就是带水印的 720p。
+         * 历史遗留：0.4.0 起不再使用。
+         *
+         * 当初的想法是「移动 UA 只能拿到带水印的 720p」，所以覆写成桌面 UA 去骗桌面接口。
+         * 事实是桌面接口会校验 UA 与客户端提示是否自洽，WebView 里改不了一致，
+         * 只会换来 200 空体。现在反过来用移动页拿 `video_id`，再去 play 接口取无水印原画。
          */
         const val DEFAULT_DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +

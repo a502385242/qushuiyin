@@ -4,9 +4,9 @@
 
 **核心思路**：无水印不是图像处理，而是**请抖音给你那条已经去掉 logo 的视频流**。
 同一个作品在 CDN 上同时挂着带水印和不带水印的版本：分享面板「保存本地」拿的是带水印那条
-（`download_addr`，带 `logo_name` 参数）；`video.bit_rate[]` 里每一档的 `play_addr` 才是不带水印的。
-本工具取 `bit_rate` 最高档的 `play_addr`，按字节原样写入相册。不做解码、不做转码，
-因此画质等于平台能给的上限（实测这条作品最高档是 1080×1920 / 1.38 Mbps / 10.1 MB）。
+（`playwm`，带 `logo_name` 参数）；播放器放的、以及 `aweme/v1/play/` 返回的才是不带水印的。
+本工具拿的是后者，按字节原样写入相册。不做解码、不做转码，
+因此画质等于平台能给的上限（实测这条作品是 1080×1920 / 10.1 MB，抽帧肉眼确认无水印）。
 
 ## 直接装到手机
 
@@ -24,67 +24,42 @@ bash tools/release.sh 0.3.0 "一句话说明这版改了什么"
 ```
 
 
-## ⚠️ 2026-11 抖音改版：必须走 WebView
+## 取数链路：移动页拿 `video_id`，play 接口拿无水印原画
 
-如果你看到别的教程说「GET 分享页，抠 `_ROUTER_DATA`」，那是**过时**的。实测结果：
+只有两步，都不需要账号、不需要签名：
 
-| 取数方式 | 结果 |
-|---|---|
-| `GET https://www.iesdouyin.com/share/video/{id}/`（带浏览器 UA） | ❌ 200，但页面只剩 1.4 KB 空壳，`_ROUTER_DATA` 里没有任何作品数据 |
-| 移动 UA（iPhone / Android WebView 默认）打开 | ❌ 跳 `m.douyin.com`，只给 **带水印的 720p**（`playwm` + `logo_name`） |
-| `aweme/v1/web/aweme/detail` 直接请求 | ❌ 403 `Blocked by ArgusSecurityPlugin Uifid Not Found` |
-| **桌面 UA 的真浏览器打开 `douyin.com/video/{id}`** | ✅ 页面自己带着 `a_bogus` 请求 `aweme/detail`，返回 **12 档清晰度** |
+```
+① WebView 打开作品页（移动 UA）→ 从页面里读出 video_id（形如 v0200fg10000...）
+② GET aweme.snssdk.com/aweme/v1/play/?video_id=... → 302 → CDN 上的无水印 mp4
+```
 
-所以取数方式改成了：**离屏 WebView + 桌面 UA + 在网络层把 `aweme/detail` 请求转发一次拿回响应**。
-让抖音自己的 JS 去算签名，我们只读结果——这样他们改签名算法时，跟着改的是他们，不是我们。
+第 ② 步实测结果：`HTTP 200`、`video/mp4`、10,120,457 字节、1080×1920，抽帧无任何水印。
+`ratio` 参数被服务端忽略——给的一律是它能提供的最高档，所以只请求一次。
 
-这一条决定了两个不能动的实现细节：
-
-1. **UA 必须是桌面版**。移动 UA 下拿到的只有带水印的 720p，等于这个 App 白做。
-2. **必须跑 WebView**，不能用 OkHttp 模拟。`a_bogus` / `uifid` / `x-secsdk-web-signature`
-   三个参数都是页面 JS 现场算的，复刻等于长期做逆向。
+第 ① 步为什么非得跑 WebView：`video_id` 不在任何纯 HTTP 响应里（分享页 HTML、旧
+`iteminfo` 接口都试过，要么空壳要么 200 空体），是页面 JS 现场算出来的。
+好在移动页**不需要签名**，只要 UA 和客户端提示自洽（即不覆写 UA）就能正常渲染。
 
 代价是解析要 3~8 秒（有一个「正在通过网页加载作品」的进度提示）。
 
-### 0.3.0 修的是「钩子从来没生效」
+### 走过的死路：桌面详情接口（0.2 ~ 0.3.3）
 
-0.2.0 用 JS 钩子在 `onPageStarted` 里 `evaluateJavascript` 注入，看着能跑，
-实际**一次都没生效**：那一刻新文档还没创建，脚本执行在旧文档的上下文里，页面一换就没了。
-表现就是不管换哪条链接都提示「页面结构有变化」。
+`aweme/v1/web/aweme/detail` 能一次给出 12 档清晰度，看起来是最优解，但它在真机上无解：
 
-0.3.0 不再依赖注入时机，改成旁观网络请求：
+| 尝试 | 结果 |
+|---|---|
+| 裸离屏 WebView + JS 钩子 | ❌ 钩子注入时机在旧文档里，从来没生效过 |
+| `shouldInterceptRequest` 转发请求 | ❌ 200 + **0 字节** |
+| 补齐 Cookie（ttwid 等） | ❌ 仍是 0 字节 |
+| 域名从 `www-hj` 换回 `www` | ❌ 仍是 0 字节 |
 
-```
-页面 JS 算出 a_bogus → 发出 GET /aweme/v1/web/aweme/detail/...
-        ↓
-WebViewClient.shouldInterceptRequest 拿到完整 URL + 请求头（含 cookie/uifid）
-        ↓
-用 OkHttp 原样转发一次（不带 Accept-Encoding，由 OkHttp 解 gzip）
-        ↓
-响应体同时交给上层解析 + 原样返回给 WebView，页面无感
-```
+真因是用 CDP 精确复刻出来的：**UA 与客户端提示自相矛盾**。
+App 把 UA 覆写成 `Windows Chrome/120`，而 `navigator.userAgentData` / `sec-ch-ua`
+如实报告 `Android 143`。抖音只要看到这个矛盾，就不报错、只回空体，或者把整页 HTML
+（830 KB）吐回来。Android WebView 能改 UA，**改不了客户端提示**，所以这条路不可能通。
 
-这个做法还有个额外好处：以前只能靠「猜」判断失败原因，现在能拿到真实响应，
-403 / 空体 / `status_code != 0` 都分得开。接口路径写进了规则文件的 `detailApiPaths`，
-抖音换路径时推一份新规则就能救，不用发版。
-
-### 0.3.3 修的是「域名换成了 www-hj，ttwid 跟不过去」
-
-真机上详情接口实际走的是 `www-hj.douyin.com`，不是 `www.douyin.com`。
-而 `ttwid` 是 **host-only cookie**，只对种它的域名有效；页面请求跨到 `www-hj` 时
-浏览器不会带上它。抖音对缺 `ttwid` 的请求**不报错，只回 `200 + 0 字节`**。
-
-这一点是用留一法测出来的：拿一份能成功的 35 项 cookie，逐项删掉重发同一个请求，
-只有删掉 `ttwid` 会变成 0 字节，删掉其余 34 项都是正常的 74 KB
-（`tools/probe-cookie.js`）。同一份 query 打 `www` 和打 `www-hj` 结果一致，
-说明签名参数与域名无关（`tools/probe-host.js`）——所以修法是把 API 请求
-canonical 化回 `www.douyin.com`，并且优先读该域名下的 cookie。
-cookie 里彻底没有 `ttwid` 时，会先请求一次首页把 `Set-Cookie` 补回来。
-
-这个坑有个很迷惑的表象：`HTTP 200`、`content-type: application/json`、状态码一切正常，
-只是 body 长度为 0。看到「200 + 空体」先查 cookie，不要怀疑 UA 或签名。
-
-
+复现脚本留在 `tools/probe-ch.js`：同一个页面，UA 与提示自洽时 73 KB 正常数据，
+矛盾时空体。想验证的话直接跑它。
 
 ---
 
@@ -93,17 +68,18 @@ cookie 里彻底没有 `ttwid` 时，会先请求一次首页把 `Set-Cookie` �
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P1 | 工程骨架、分享入口、链接识别 | ✅ |
-| P2 | 解析核心（WebView 取数 + 候选路径 + 错误分类） | ✅ 单测 + 真浏览器验证 |
+| P2 | 解析核心（移动页拿 `video_id` + play 接口） | ✅ 单测 + 真浏览器验证 |
 | P3 | 下载器 + MediaStore 写入相册 | ⏳ 未开始 |
 | P4 | 失败驱动的在线修复（拉取 → 验签 → 落盘 → 重试） | ✅ 代码完成 |
 | P5 | 历史记录、Release 签名 | ⏳ |
 
 **验证到什么程度**：
-- 真实分享链接跑通了全链路（短链 → 作品 ID → 桌面页 → 详情 JSON → 12 档清晰度）
-- 最高档 1080×1920 流下载后抽帧肉眼确认**无水印**，字节数与接口给的 `data_size` 完全一致
-- 「转发请求」这条路在真 Chrome 里单独验过：把页面自己发出的 detail 请求连同 Cookie
-  在页面之外重发一次，同样返回 200 + 12 档（`tools/probe-forward.js`）
-- 还没在**真机**上跑过（本机没有 adb），WebView 环节是唯一剩下的不确定项
+- 短链 → 作品 ID → 移动页 → `video_id` → play 接口，整条链路在真 Chrome 里跑通了
+  （`tools/probe-mobile.js`）
+- play 接口返回的片子下下来抽帧肉眼确认**无水印**：1080×1920、10,120,457 字节、无 logo 无账号水印
+- 45 个单测全绿，其中一条锁住「合成 JSON → 解析器」的字段契约
+- 还没在**真机**上跑过（本机没有 adb）。唯一剩下的不确定项是 Android WebView 里
+  播放器会不会正常初始化——`tools/probe-ch.js` 的用例 D 已用同版本内核复现过成功路径
 
 ---
 

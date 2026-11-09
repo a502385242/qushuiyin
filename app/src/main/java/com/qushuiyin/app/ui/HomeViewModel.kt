@@ -50,9 +50,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         detailSourceFactory = { rules ->
             WebDetailFetcher(
                 context = app,
-                urlTemplate = rules.detailUrlTemplate,
-                userAgent = rules.desktopUa,
-                apiPaths = rules.detailApiPaths
+                urlTemplate = rules.detailUrlTemplate
             ).also { lastSource = it }
         }
     )

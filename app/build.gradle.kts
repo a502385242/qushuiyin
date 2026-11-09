@@ -45,8 +45,8 @@ android {
         applicationId = "com.qushuiyin.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.3.3"
+        versionCode = 8
+        versionName = "0.4.0"
 
         // 修复配置的镜像地址（目录前缀，末尾带 /），可用 local.properties 的 repair.mirrors 覆盖
         buildConfigField(
